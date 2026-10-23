@@ -1,0 +1,29 @@
+{
+  "name": "rackpad",
+  "version": "0.1.0",
+  "description": "Turn your phone into a trackpad, keyboard and remote for your Mac.",
+  "type": "module",
+  "bin": {
+    "rackpad": "bin/rackpad.js"
+  },
+  "scripts": {
+    "start": "node bin/rackpad.js",
+    "dev": "node bin/rackpad.js --dry-run --verbose",
+    "build:helper": "node bin/rackpad.js build-helper",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "files": [
+    "bin",
+    "server",
+    "helper",
+    "web"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "ws": "^8.22.0"
+  }
+}
