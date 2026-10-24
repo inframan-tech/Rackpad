@@ -2,7 +2,8 @@
 //
 // Reads one JSON command per line on stdin (sent by the Node server), posts
 // the matching mouse/keyboard events, draws the cursor beacon and click
-// ripples, and reports the frontmost app on stdout as JSON lines.
+// ripples, and reports the frontmost app on stdout as JSON lines. When the
+// phone watches the screen, JPEG frames go out on file descriptor 3.
 //
 // Build: swiftc -O -swift-version 5 -o rackpad-helper RackpadHelper.swift
 // (the Node server does this automatically on first run).
@@ -10,7 +11,10 @@
 import AppKit
 import ApplicationServices
 import Carbon
+import CoreImage
+import IOKit.pwr_mgt
 import QuartzCore
+@preconcurrency import ScreenCaptureKit
 
 // MARK: - Output to Node
 
@@ -129,7 +133,18 @@ final class Input {
 
     func move(dx: Double, dy: Double) {
         let b = base()
-        let p = clamp(CGPoint(x: b.x + dx, y: b.y + dy), from: b)
+        post(to: clamp(CGPoint(x: b.x + dx, y: b.y + dy), from: b), dx: dx, dy: dy)
+    }
+
+    /// Puts the pointer at a point (global display coordinates): a tap on the
+    /// streamed screen lands right there.
+    func moveTo(_ target: CGPoint) {
+        let b = base()
+        let p = clamp(target, from: b)
+        post(to: p, dx: p.x - b.x, dy: p.y - b.y)
+    }
+
+    private func post(to p: CGPoint, dx: Double, dy: Double) {
         let type: CGEventType
         let button: CGMouseButton
         if leftDown { type = .leftMouseDragged; button = .left }
@@ -521,13 +536,167 @@ final class AppWatcher {
     }
 }
 
+// MARK: - Screen streaming
+
+/// Streams the main display to the phone as JPEG frames on file descriptor 3,
+/// each a 4-byte big-endian length followed by the image. ScreenCaptureKit
+/// only hands over a frame when something on screen changed, so a still
+/// screen costs nothing.
+// Its state is only touched on the main thread; frames are handled on `queue`.
+final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    private var stream: SCStream?
+    private var starting = false
+    private var quality = 0.6
+    private let queue = DispatchQueue(label: "rackpad.screen", qos: .userInteractive)
+    private let ci = CIContext(options: [.cacheIntermediates: false])
+    private let out: FileHandle? = fcntl(3, F_GETFD) == -1 ? nil : FileHandle(fileDescriptor: 3, closeOnDealloc: false)
+    /// The streamed display, in global coordinates (where taps on the picture go).
+    private(set) var bounds = CGDisplayBounds(CGMainDisplayID())
+
+    func start(maxWidth: Int, fps: Int, quality: Double) {
+        self.quality = min(max(quality, 0.2), 0.95)
+        guard out != nil, stream == nil, !starting else { return }
+        guard CGPreflightScreenCaptureAccess() else {
+            CGRequestScreenCaptureAccess() // the system's own prompt, once
+            emit(["ev": "screen", "on": false, "error": "permission"])
+            return
+        }
+        starting = true
+        Task {
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                let mainID = CGMainDisplayID()
+                guard let display = content.displays.first(where: { $0.displayID == mainID }) ?? content.displays.first else {
+                    throw NSError(domain: "Rackpad", code: 1, userInfo: [NSLocalizedDescriptionKey: "no display to stream"])
+                }
+                let screen = NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display.displayID }
+                let pixelsWide = Double(display.width) * Double(screen?.backingScaleFactor ?? 2)
+                let width = min(Double(max(maxWidth, 320)), pixelsWide)
+                let config = SCStreamConfiguration()
+                config.width = Int(width)
+                config.height = Int((width * Double(display.height) / Double(display.width)).rounded())
+                config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(min(max(fps, 1), 60)))
+                config.pixelFormat = kCVPixelFormatType_32BGRA
+                config.showsCursor = true
+                config.queueDepth = 3
+                let s = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: config, delegate: self)
+                try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+                try await s.startCapture()
+                let displayID = display.displayID
+                DispatchQueue.main.async {
+                    self.starting = false
+                    self.stream = s
+                    self.bounds = CGDisplayBounds(displayID)
+                }
+                emit(["ev": "screen", "on": true, "width": config.width, "height": config.height])
+            } catch {
+                DispatchQueue.main.async { self.starting = false }
+                let declined = (error as NSError).code == -3801 // SCStreamError.userDeclined
+                emit(["ev": "screen", "on": false, "error": declined ? "permission" : error.localizedDescription])
+            }
+        }
+    }
+
+    func stop() {
+        guard let s = stream else { return }
+        stream = nil
+        s.stopCapture { _ in }
+        emit(["ev": "screen", "on": false])
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        DispatchQueue.main.async { if self.stream === stream { self.stream = nil } }
+        emit(["ev": "screen", "on": false, "error": error.localizedDescription])
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, sample.isValid, let out = out,
+              let info = (CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])?.first,
+              let raw = info[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
+              let pixels = sample.imageBuffer,
+              let srgb = CGColorSpace(name: CGColorSpace.sRGB) else { return }
+        let options = [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): quality]
+        guard let jpeg = ci.jpegRepresentation(of: CIImage(cvPixelBuffer: pixels), colorSpace: srgb, options: options) else { return }
+        var length = UInt32(jpeg.count).bigEndian
+        var frame = Data(bytes: &length, count: 4)
+        frame.append(jpeg)
+        out.write(frame)
+    }
+}
+
+// MARK: - Screen off
+
+/// While the phone streams, the Mac's screen can look switched off: the
+/// brightness goes to zero, but macOS keeps drawing (a display that really
+/// sleeps stops drawing, and the stream with it). The brightness comes back
+/// when the phone stops, when nothing has renewed the request for a while,
+/// and when the helper exits.
+final class ScreenOff {
+    private typealias GetBrightness = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
+    private typealias SetBrightness = @convention(c) (CGDirectDisplayID, Float) -> Int32
+    private var getBrightness: GetBrightness?
+    private var setBrightness: SetBrightness?
+    private var saved: Float?
+    private var awake: IOPMAssertionID = 0
+    private var renewed: TimeInterval = 0
+    private var timer: Timer?
+
+    init() {
+        // DisplayServices is how macOS itself sets the built-in display's brightness.
+        guard let lib = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_NOW) else { return }
+        if let f = dlsym(lib, "DisplayServicesGetBrightness") { getBrightness = unsafeBitCast(f, to: GetBrightness.self) }
+        if let f = dlsym(lib, "DisplayServicesSetBrightness") { setBrightness = unsafeBitCast(f, to: SetBrightness.self) }
+    }
+
+    /// Turn it on, or renew it: it gives the screen back by itself after 15 s without renewal.
+    func on() {
+        renewed = now()
+        guard saved == nil, let get = getBrightness, let set = setBrightness else { return }
+        var level: Float = 0.5
+        guard get(CGMainDisplayID(), &level) == 0 else { return }
+        saved = level
+        _ = set(CGMainDisplayID(), 0)
+        IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                    "Rackpad streams the screen" as CFString, &awake)
+        let t = Timer(timeInterval: 5, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        tick()
+        emit(["ev": "screenOff", "on": true])
+    }
+
+    private func tick() {
+        if now() - renewed > 15 { off(); return }
+        // Counts as activity, so the screen saver and the auto-lock stay away while streaming.
+        var activity: IOPMAssertionID = 0
+        IOPMAssertionDeclareUserActivity("Rackpad streams the screen" as CFString, kIOPMUserActiveLocal, &activity)
+    }
+
+    func off() {
+        timer?.invalidate()
+        timer = nil
+        if awake != 0 {
+            IOPMAssertionRelease(awake)
+            awake = 0
+        }
+        guard let level = saved else { return }
+        saved = nil
+        _ = setBrightness?(CGMainDisplayID(), level)
+        emit(["ev": "screenOff", "on": false])
+    }
+}
+
 // MARK: - Command loop
 
 let input = Input()
 let beacon = Beacon()
 let ripples = Ripples()
 let watcher = AppWatcher()
+let streamer = ScreenStreamer()
+let screenOff = ScreenOff()
 var lastBeaconPoke: TimeInterval = 0
+
+func unit(_ v: Any?) -> Double { min(max(num(v), 0), 1) }
 
 func handle(_ cmd: [String: Any]) {
     guard let op = cmd["op"] as? String else { return }
@@ -553,6 +722,18 @@ func handle(_ cmd: [String: Any]) {
         if let s = cmd["s"] as? String { input.type(s) }
     case "media":
         if let k = cmd["k"] as? String { DispatchQueue.main.async { postMediaKey(k) } }
+    case "moveTo":
+        // x and y run 0…1 across the streamed display.
+        let b = streamer.bounds
+        input.moveTo(CGPoint(x: b.minX + unit(cmd["x"]) * (b.width - 1), y: b.minY + unit(cmd["y"]) * (b.height - 1)))
+        DispatchQueue.main.async { beacon.poke() }
+    case "screen":
+        let on = (cmd["on"] as? Bool) ?? false
+        let width = Int(num(cmd["maxWidth"])), fps = Int(num(cmd["fps"])), quality = num(cmd["quality"])
+        DispatchQueue.main.async { on ? streamer.start(maxWidth: width, fps: fps, quality: quality) : streamer.stop() }
+    case "screenOff":
+        let on = (cmd["on"] as? Bool) ?? false
+        DispatchQueue.main.async { on ? screenOff.on() : screenOff.off() }
     case "missionControl":
         DispatchQueue.main.async { openMissionControl() }
     case "config":
@@ -573,6 +754,15 @@ func handle(_ cmd: [String: Any]) {
 signal(SIGPIPE, SIG_DFL)
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+
+// Never leave the screen dark: give the brightness back when told to quit.
+signal(SIGTERM, SIG_IGN)
+let quitSignal = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+quitSignal.setEventHandler {
+    screenOff.off()
+    exit(0)
+}
+quitSignal.resume()
 
 // Ask for Accessibility access (shows the system prompt the first time), then
 // keep checking until it's granted so the phone can say what's missing.
@@ -599,7 +789,8 @@ let reader = Thread {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
         handle(obj)
     }
-    // Node went away: so do we.
+    // Node went away: so do we, giving the screen its brightness back first.
+    DispatchQueue.main.sync { screenOff.off() }
     exit(0)
 }
 reader.qualityOfService = .userInteractive

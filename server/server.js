@@ -30,6 +30,9 @@ const MIME = {
 };
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+const MAX_STREAM_WIDTH = 1600; // px across: sharp on a phone, light on Wi-Fi
+const STREAM_FPS = 30;
+const STREAM_QUALITY = 0.6;
 
 // Third-party browser code, served straight from node_modules.
 const VENDOR = new Map([['/vendor/jsQR.js', createRequire(import.meta.url).resolve('jsqr')]]);
@@ -58,6 +61,63 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
     broadcast({ t: 'context', ...ctx });
   });
   backend.on('status', (status) => broadcast({ t: 'status', backend: status }));
+
+  // ── Screen streaming ──────────────────────────────────────────────────
+  // A phone watching the screen gets the newest frame as soon as it has shown
+  // the last one: there's never a queue, so the picture is never behind.
+  let streaming = null; // what the helper streams at: { maxWidth }
+  let lastFrame = null;
+  let darkened = false;
+  const watching = () => [...clients.entries()].filter(([, c]) => c.screen.on);
+
+  function updateStream() {
+    const viewers = watching();
+    if (!viewers.length) {
+      if (streaming) backend.send({ op: 'screen', on: false });
+      streaming = null;
+      lastFrame = null;
+      return;
+    }
+    const maxWidth = Math.min(MAX_STREAM_WIDTH, Math.max(...viewers.map(([, c]) => c.screen.maxWidth)));
+    if (streaming?.maxWidth === maxWidth) return;
+    if (streaming) backend.send({ op: 'screen', on: false }); // start again at the new size
+    backend.send({ op: 'screen', on: true, maxWidth, fps: STREAM_FPS, quality: STREAM_QUALITY });
+    streaming = { maxWidth };
+  }
+
+  function deliver(ws, c, jpeg) {
+    const s = c.screen;
+    const showing = s.waiting && performance.now() - s.sentAt < 2000; // no answer in 2 s: send anyway
+    if (showing || ws.readyState !== ws.OPEN || ws.bufferedAmount > 2_000_000) {
+      s.pending = jpeg;
+      return;
+    }
+    s.pending = null;
+    s.waiting = true;
+    s.sentAt = performance.now();
+    ws.send(jpeg, { binary: true });
+  }
+
+  backend.on('frame', (jpeg) => {
+    lastFrame = jpeg;
+    for (const [ws, c] of watching()) deliver(ws, c, jpeg);
+  });
+  backend.on('screen', (state) => {
+    const data = JSON.stringify({ t: 'screen', ...state });
+    for (const [ws] of watching()) if (ws.readyState === ws.OPEN) ws.send(data);
+  });
+
+  // Screen off (dark but still drawing) while a watching phone wants it. The
+  // helper gives the screen back by itself unless this is renewed.
+  function updateScreenOff() {
+    const want = watching().some(([, c]) => c.screenOff);
+    if (want) backend.send({ op: 'screenOff', on: true });
+    else if (darkened) backend.send({ op: 'screenOff', on: false });
+    darkened = want;
+  }
+  const renewScreenOff = setInterval(() => darkened && backend.send({ op: 'screenOff', on: true }), 5000);
+  renewScreenOff.unref();
+  backend.on('screenOff', (on) => broadcast({ t: 'screenOff', on }));
 
   const onRequest = (req, res) => {
     handleHttp(req, res).catch((err) => {
@@ -183,7 +243,8 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
       onVolume: (v) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ t: 'volume', ...v })),
       onStats: backend.verbose ? (st) => log(`glide: ${st.moves} moves in 3s, ${st.late} late, playing ${st.buffer} ms behind`) : null,
     });
-    clients.set(ws, { session, name });
+    const client = { session, name, screen: { on: false, maxWidth: 1280, waiting: false, pending: null, sentAt: 0 }, screenOff: false };
+    clients.set(ws, client);
     log(`📱 ${name} connected (${req.socket.remoteAddress}${platformOf(req.headers['user-agent'])})`);
 
     ws.isAlive = true;
@@ -203,6 +264,26 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
         ws.send(JSON.stringify({ t: 'pong', id: msg.id }));
         return;
       }
+      if (msg?.t === 'screen') {
+        client.screen.on = msg.on === true;
+        client.screen.maxWidth = Math.round(Math.min(MAX_STREAM_WIDTH, Math.max(320, Number(msg.maxWidth) || 1280)));
+        client.screen.waiting = false;
+        client.screen.pending = null;
+        updateStream();
+        updateScreenOff();
+        if (client.screen.on && lastFrame) deliver(ws, client, lastFrame);
+        return;
+      }
+      if (msg?.t === 'frameAck') {
+        client.screen.waiting = false;
+        if (client.screen.on && client.screen.pending) deliver(ws, client, client.screen.pending);
+        return;
+      }
+      if (msg?.t === 'screenOff') {
+        client.screenOff = msg.on === true;
+        updateScreenOff();
+        return;
+      }
       try {
         session.handle(msg);
       } catch (err) {
@@ -212,6 +293,8 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
     ws.on('close', () => {
       session.dispose();
       clients.delete(ws);
+      updateStream();
+      updateScreenOff();
       log(`📱 ${name} disconnected`);
     });
   }
@@ -254,6 +337,7 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
     },
     close() {
       clearInterval(heartbeat);
+      clearInterval(renewScreenOff);
       for (const ws of clients.keys()) ws.terminate();
       wss.close();
       const closing = [server, secureServer].filter((srv) => srv?.listening).map((srv) => new Promise((resolve) => srv.close(() => resolve())));

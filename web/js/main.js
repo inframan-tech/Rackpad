@@ -11,6 +11,7 @@ import { Keys } from './keys.js';
 import { WheelView } from './wheelview.js';
 import { Smart } from './smart.js';
 import { readPhoto, tokenFromLink } from './scan.js';
+import { ScreenView } from './screen.js';
 
 const $ = (sel) => document.querySelector(sel);
 const store = {
@@ -31,7 +32,7 @@ const store = {
   },
 };
 
-const VIEWS = ['pad', 'keys', 'remote', 'app'];
+const VIEWS = ['pad', 'keys', 'remote', 'screen', 'app'];
 const DEFAULTS = {
   surface: 'black',
   accent: 'ice',
@@ -197,6 +198,11 @@ function start() {
     },
   });
   const wheel = new WheelView({ root: $('[data-view="remote"]'), send, feel });
+  const screenView = new ScreenView({ root: $('[data-view="screen"]'), send, feel });
+  conn.addEventListener('frame', (e) => screenView.frame(e.detail));
+  // The stream runs only while the Screen view is on screen.
+  const watchScreen = (force = false) => screenView.watch(app.dataset.current === 'screen' && document.visibilityState === 'visible', force);
+  document.addEventListener('visibilitychange', () => watchScreen());
   const smart = new Smart({
     panel: $('#smart-panel'),
     send,
@@ -227,6 +233,7 @@ function start() {
     app.dataset.current = name;
     if (name !== 'keys') $('#type-field').blur();
     if (name === 'remote') send({ t: 'getVolume' });
+    watchScreen();
   }
 
   for (const b of document.querySelectorAll('#dock [data-tab]')) {
@@ -260,6 +267,11 @@ function start() {
       return;
     }
     closeSheets();
+    // Sideways, the screen fills the phone; from anywhere else, it's the trackpad.
+    if (view === 'screen') {
+      render('screen');
+      return;
+    }
     render('pad');
     wake();
     if (!settings.sideways) {
@@ -504,6 +516,7 @@ function start() {
     if (e.detail === 'open') {
       send(macSettings());
       wake();
+      watchScreen(true); // a new connection: ask for the screen again if it's showing
     }
     if (e.detail === 'unauthorized') showPairing("This phone's pairing code is no longer valid. Scan the QR code on your Mac again.");
   });
@@ -535,6 +548,12 @@ function start() {
         break;
       case 'volume':
         wheel.showVolume(msg);
+        break;
+      case 'screen':
+        screenView.status(msg);
+        break;
+      case 'screenOff':
+        screenView.screenOff(msg.on);
         break;
       default:
         break;

@@ -36,12 +36,13 @@ done
 
 # AirDrop, Handoff and Universal Control hop the Wi-Fi radio off your network
 # about twice a second, and each hop stalls Wi-Fi for ~90 ms: a hitch you can
-# feel in the pointer. This pauses them until Rackpad quits.
+# feel in the pointer. macOS switches them back on whenever it wants them, so
+# a small root loop switches them off again within a second, for as long as
+# this script runs, and turns them back on when Rackpad quits.
 if [ "$pause_airdrop" = 1 ] && ifconfig awdl0 >/dev/null 2>&1; then
-  echo "Pausing AirDrop & Handoff while Rackpad runs (macOS may ask for your password)…"
-  sudo ifconfig awdl0 down
-  trap 'sudo -n ifconfig awdl0 up 2>/dev/null && echo "AirDrop & Handoff are back on." \
-    || echo "Turn AirDrop & Handoff back on with: sudo ifconfig awdl0 up (or restart the Mac)"' EXIT
+  echo "Keeping AirDrop & Handoff paused while Rackpad runs (macOS asks for your password once)…"
+  sudo -v
+  sudo sh -c "while kill -0 $$ 2>/dev/null; do ifconfig awdl0 down 2>/dev/null; sleep 1; done; ifconfig awdl0 up" &
 fi
 
 # caffeinate keeps the Mac from going to sleep while Rackpad is running.

@@ -257,6 +257,36 @@ test('smart layout follows the front app and its buttons work', { skip }, async 
   await page.waitForFunction(() => document.querySelector('section[data-view="keys"]').classList.contains('active'));
 });
 
+test('the Screen view streams the Mac, and a tap clicks right there', { skip }, async () => {
+  await show('screen');
+  await waitFor(() => opsOf('screen').some((o) => o.on === true));
+  await page.waitForFunction(() => document.querySelector('#screen-img').naturalWidth > 0);
+  // Frames keep coming: each one shown is acknowledged, and the next arrives.
+  const first = await page.getAttribute('#screen-img', 'src');
+  await page.waitForFunction((src) => document.querySelector('#screen-img').getAttribute('src') !== src, first);
+
+  // Tap at 25% across and halfway down the Mac's screen, wherever the picture sits on the phone.
+  const box = await page.locator('#screen-img').boundingBox();
+  const [w, h] = await page.evaluate(() => [document.querySelector('#screen-img').naturalWidth, document.querySelector('#screen-img').naturalHeight]);
+  const scale = Math.min(box.width / w, box.height / h);
+  const x = box.x + (box.width - w * scale) / 2 + 0.25 * w * scale;
+  const y = box.y + (box.height - h * scale) / 2 + 0.5 * h * scale;
+  await settle();
+  reset();
+  await gesture([[[x, y]]]);
+  await waitFor(() => opsOf('button').length === 2);
+  const to = opsOf('moveTo').at(-1);
+  assert.ok(Math.abs(to.x - 0.25) < 0.01 && Math.abs(to.y - 0.5) < 0.01, JSON.stringify(to));
+
+  // Screen off while watching; the Mac gets its screen back when the phone stops watching.
+  reset();
+  await page.locator('#screen-off').click();
+  await waitFor(() => opsOf('screenOff').some((o) => o.on === true));
+  await page.waitForFunction(() => document.querySelector('#screen-off').getAttribute('aria-pressed') === 'true');
+  await show('pad');
+  await waitFor(() => opsOf('screen').some((o) => o.on === false) && opsOf('screenOff').some((o) => o.on === false));
+});
+
 test('sideways, the whole phone is the trackpad', { skip }, async () => {
   await show('keys');
   await page.setViewportSize({ width: 852, height: 393 });

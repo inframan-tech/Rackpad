@@ -76,6 +76,14 @@
       </div>
     </section>
 
+    <section class="view" data-view="screen">
+      <div class="screen" id="screen" aria-label="Your Mac's screen">
+        <img id="screen-img" alt="">
+        <p class="screen-msg" id="screen-msg" hidden></p>
+      </div>
+      <button class="screen-off" id="screen-off" aria-pressed="false" aria-label="Turn the Mac's screen off while you watch"><i data-icon="moon"></i></button>
+    </section>
+
     <section class="view" data-view="app">
       <div class="smart-panel" id="smart-panel"></div>
     </section>
@@ -85,6 +93,7 @@
     <button role="tab" data-tab="pad" aria-label="Trackpad"><i data-icon="trackpad"></i></button>
     <button role="tab" data-tab="keys" aria-label="Keyboard"><i data-icon="keyboard"></i></button>
     <button role="tab" data-tab="remote" aria-label="Remote"><i data-icon="wheel"></i></button>
+    <button role="tab" data-tab="screen" aria-label="Screen"><i data-icon="monitor"></i></button>
     <button role="tab" data-tab="app" id="app-tab" aria-label="App controls"><img class="app-ic" id="app-icon" alt="" hidden><i data-icon="grid" id="app-fallback"></i></button>
     <button id="open-settings" aria-label="Settings"><i data-icon="sliders"></i></button>
   </nav>

@@ -94,11 +94,13 @@ to arrive. What's left is mostly your Wi-Fi. In order of impact:
 1. **Pause AirDrop & Handoff while you use it.** They share the Mac's Wi-Fi
    radio and hop it off your network about twice a second; each hop stalls
    Wi-Fi for ~90 ms, and you feel it as a hitch. Start with
-   `./start.sh --no-airdrop`, which pauses them until Rackpad quits, or run
-   `sudo ifconfig awdl0 down` yourself (`sudo ifconfig awdl0 up` or a restart
-   brings them back). Rackpad warns at start when they're on. Measured on a
-   MacBook Air: pings to the router went from spikes of 95 ms every half
-   second to a steady 3 ms.
+   `./start.sh --no-airdrop`: it asks for your password once and keeps them
+   paused for the whole session (macOS switches them back on whenever it
+   wants them, so it switches them off again within a second), then turns
+   them back on when Rackpad quits. `sudo ifconfig awdl0 down` pauses them
+   just once. Rackpad warns at start when they're on. Measured on a MacBook
+   Air: pings to the router went from spikes of 95 ms every half second to a
+   steady 3 ms.
 2. **Keep Rackpad in front on the phone.** While you're using it, the phone
    and the Mac swap a tiny message every 20 ms so neither Wi-Fi radio naps. A
    napping radio holds messages: a round trip is ~75 ms with one message a

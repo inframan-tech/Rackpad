@@ -15,6 +15,31 @@ export const HELPER_SOURCE = path.join(HERE, '..', 'helper', 'RackpadHelper.swif
 const HELPER_BIN = path.join(CONFIG_DIR, 'bin', 'rackpad-helper');
 
 const DEFAULT_APP = { bundleId: 'com.apple.finder', name: 'Finder' };
+const DRY_RUN_SCREEN = path.join(HERE, 'dry-run-screen.jpg');
+
+// Screen frames from the helper (file descriptor 3): a 4-byte big-endian
+// length, then a JPEG. Chunks from the pipe arrive split anywhere.
+export class FrameReader {
+  constructor(onFrame, { maxFrame = 16 * 1024 * 1024 } = {}) {
+    this.onFrame = onFrame;
+    this.maxFrame = maxFrame;
+    this.buf = Buffer.alloc(0);
+  }
+
+  push(chunk) {
+    this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
+    while (this.buf.length >= 4) {
+      const len = this.buf.readUInt32BE(0);
+      if (len > this.maxFrame) {
+        this.buf = Buffer.alloc(0); // not a frame boundary any more: start over
+        return;
+      }
+      if (this.buf.length < 4 + len) return;
+      this.onFrame(this.buf.subarray(4, 4 + len));
+      this.buf = this.buf.subarray(4 + len);
+    }
+  }
+}
 
 // For --verbose logs: every command, but never what was typed.
 export function describeOp(op) {
@@ -61,14 +86,30 @@ export class DryRunBackend extends Backend {
       if (op.k === 'voldown') this.level = Math.max(0, this.level - 6.25);
       if (op.k === 'mute') this.muted = !this.muted;
     }
+    if (op.op === 'screen') this.fakeScreen(!!op.on);
+    if (op.op === 'screenOff') this.emit('screenOff', !!op.on);
     if (this.verbose) this.log(`→ ${describeOp(op)}`);
+  }
+
+  // A stand-in picture a few times a second, so the screen view can be tried anywhere.
+  fakeScreen(on) {
+    clearInterval(this.screenTimer);
+    this.screenTimer = null;
+    this.emit('screen', { on, error: null, width: 640, height: 400 });
+    if (!on) return;
+    this.screenFrame ??= fs.readFileSync(DRY_RUN_SCREEN);
+    this.emit('frame', this.screenFrame);
+    this.screenTimer = setInterval(() => this.emit('frame', this.screenFrame), 250);
+    this.screenTimer.unref();
   }
 
   async volume() {
     return { level: Math.round(this.level), muted: this.muted };
   }
 
-  stop() {}
+  stop() {
+    this.fakeScreen(false);
+  }
 }
 
 export class NativeBackend extends Backend {
@@ -92,10 +133,14 @@ export class NativeBackend extends Backend {
       this.setStatus({ ready: false, error: err.message });
       return;
     }
-    const proc = spawn(bin, [], { stdio: ['pipe', 'pipe', 'inherit'] });
+    // stdin: commands; stdout: events; fd 3: screen frames.
+    const proc = spawn(bin, [], { stdio: ['pipe', 'pipe', 'inherit', 'pipe'] });
     this.proc = proc;
     proc.stdin.on('error', () => {});
     createInterface({ input: proc.stdout }).on('line', (line) => this.onLine(line));
+    const frames = new FrameReader((jpeg) => this.emit('frame', jpeg));
+    proc.stdio[3].on('data', (chunk) => frames.push(chunk));
+    proc.stdio[3].on('error', () => {});
     proc.on('error', (err) => this.setStatus({ ready: false, error: err.message }));
     proc.on('exit', (code, signal) => {
       if (this.proc !== proc) return;
@@ -125,6 +170,12 @@ export class NativeBackend extends Backend {
         break;
       case 'app':
         this.setApp({ bundleId: ev.bundleId ?? '', name: ev.name ?? '', title: ev.title, icon: ev.icon });
+        break;
+      case 'screen':
+        this.emit('screen', { on: !!ev.on, error: ev.error ?? null, width: ev.width, height: ev.height });
+        break;
+      case 'screenOff':
+        this.emit('screenOff', !!ev.on);
         break;
       case 'log':
         this.log(`helper: ${ev.msg}`);

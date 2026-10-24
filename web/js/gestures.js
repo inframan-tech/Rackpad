@@ -333,3 +333,120 @@ export class StripRecognizer {
     this.g = null;
   }
 }
+
+// The streamed screen: touches act where they land. A finger that moves
+// takes the pointer with it; a tap clicks there; hold and let go to
+// right-click; hold, then move, to drag; two fingers scroll. `at(point)`
+// turns a touch into 0…1 coordinates on the Mac's display, or null when the
+// touch is outside the picture.
+export class ScreenRecognizer {
+  constructor(emit, {
+    at,
+    feel = () => {},
+    opts = {},
+    setTimer = (fn, ms) => setTimeout(fn, ms),
+    clearTimer = (id) => clearTimeout(id),
+  } = {}) {
+    this.emit = emit;
+    this.at = at;
+    this.feel = feel;
+    this.o = { ...TRACKPAD, ...opts };
+    this.setTimer = setTimer;
+    this.clearTimer = clearTimer;
+    this.g = null;
+    this.timer = null;
+    this.vel = new Velocity();
+  }
+
+  start(touches, t) {
+    if (!this.g) {
+      const first = touches[0];
+      this.emit({ t: 'touch' });
+      this.g = { t0: t, lastT: t, start: first, startAt: this.at(first), lastAt: null, maxCount: 0, mode: null, c: null };
+      if (touches.length === 1 && this.g.startAt) this.timer = this.setTimer(() => this.hold(), this.o.holdMs);
+    }
+    const g = this.g;
+    g.maxCount = Math.max(g.maxCount, touches.length);
+    if (touches.length >= 2) {
+      this.cancelHold();
+      if (g.mode === null || g.mode === 'point') {
+        g.mode = 'scroll';
+        g.c = centroid(touches);
+        this.vel.reset();
+      }
+    }
+  }
+
+  hold() {
+    this.timer = null;
+    const g = this.g;
+    if (g && g.mode === null && g.maxCount === 1) {
+      g.mode = 'held';
+      this.feel('grab');
+    }
+  }
+
+  cancelHold() {
+    if (this.timer !== null) this.clearTimer(this.timer);
+    this.timer = null;
+  }
+
+  move(touches, t) {
+    const g = this.g;
+    if (!g || !touches.length) return;
+    const dt = Math.max(t - g.lastT, 1);
+    g.lastT = t;
+    if (g.mode === 'scroll') {
+      if (touches.length < 2) return;
+      const c = centroid(touches);
+      const dx = c.x - g.c.x;
+      const dy = c.y - g.c.y;
+      g.c = c;
+      if (dx || dy) {
+        this.emit({ t: 'scroll', dx, dy, dt, ts: t });
+        this.vel.add(t, dx, dy, dt);
+      }
+      return;
+    }
+    const p = touches[0];
+    const far = dist(p, g.start) >= this.o.tapSlop;
+    if (g.mode === 'held' && far && g.startAt) {
+      g.mode = 'drag';
+      this.emit({ t: 'downAt', ...g.startAt });
+    } else if (g.mode === null && far) {
+      this.cancelHold();
+      g.mode = 'point';
+    }
+    if (g.mode !== 'point' && g.mode !== 'drag') return;
+    const a = this.at(p);
+    if (!a) return;
+    g.lastAt = a;
+    this.emit({ t: 'pointAt', ...a });
+  }
+
+  end(touches, t) {
+    const g = this.g;
+    if (!g || touches.length > 0) return;
+    this.cancelHold();
+    this.g = null;
+    if (g.mode === 'scroll') {
+      const { vx, vy } = this.vel.get(t);
+      this.emit({ t: 'scrollEnd', vx, vy });
+    } else if (g.mode === 'drag') {
+      this.emit({ t: 'upAt', ...(g.lastAt ?? g.startAt) });
+    } else if (g.mode === 'held' && g.startAt) {
+      this.emit({ t: 'clickAt', ...g.startAt, b: 'right' });
+      this.feel('tap2');
+    } else if (g.mode === null && g.startAt && t - g.t0 < this.o.tapMs) {
+      this.emit({ t: 'clickAt', ...g.startAt, b: g.maxCount >= 2 ? 'right' : 'left' });
+      this.feel(g.maxCount >= 2 ? 'tap2' : 'tap');
+    }
+  }
+
+  cancel() {
+    this.cancelHold();
+    if (this.g?.mode === 'drag') this.emit({ t: 'upAt', ...(this.g.lastAt ?? this.g.startAt) });
+    if (this.g?.mode === 'scroll') this.emit({ t: 'scrollEnd', vx: 0, vy: 0 });
+    this.g = null;
+  }
+}

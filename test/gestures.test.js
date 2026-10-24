@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { TrackpadRecognizer, StripRecognizer, Velocity } from '../web/js/gestures.js';
+import { TrackpadRecognizer, StripRecognizer, ScreenRecognizer, Velocity } from '../web/js/gestures.js';
 
 const P = (id, x, y) => ({ id, x, y });
 
@@ -208,4 +208,68 @@ test('velocity averages recent samples', () => {
   const { vx } = v.get(20);
   assert.ok(Math.abs(vx - 10 / 16) < 1e-9);
   assert.deepEqual(v.get(500), { vx: 0, vy: 0 });
+});
+
+// ── The streamed screen ───────────────────────────────────────────────────
+
+function screen() {
+  const out = [];
+  let fire = null;
+  // A 200×100 picture at the top left of the phone: coordinates map straight to 0…1.
+  const at = (p) => (p.x < 0 || p.y < 0 || p.x > 200 || p.y > 100 ? null : { x: p.x / 200, y: p.y / 100 });
+  const rec = new ScreenRecognizer((m) => out.push(m), {
+    at,
+    setTimer: (fn) => ((fire = fn), 1),
+    clearTimer: () => (fire = null),
+  });
+  return { rec, out, hold: () => fire?.() };
+}
+
+test('screen: a tap clicks right where it lands', () => {
+  const { rec, out } = screen();
+  rec.start([P(1, 50, 25)], 0);
+  rec.end([], 90);
+  assert.deepEqual(out.at(-1), { t: 'clickAt', x: 0.25, y: 0.25, b: 'left' });
+});
+
+test('screen: a moving finger takes the pointer with it, without clicking', () => {
+  const { rec, out } = screen();
+  rec.start([P(1, 20, 20)], 0);
+  rec.move([P(1, 40, 20)], 16);
+  rec.move([P(1, 100, 50)], 32);
+  rec.end([], 48);
+  assert.deepEqual(out.filter((m) => m.t === 'pointAt').at(-1), { t: 'pointAt', x: 0.5, y: 0.5 });
+  assert.ok(!out.some((m) => m.t === 'clickAt' || m.t === 'downAt'));
+});
+
+test('screen: hold and let go right-clicks; hold and move drags', () => {
+  let h = screen();
+  h.rec.start([P(1, 100, 50)], 0);
+  h.hold();
+  h.rec.end([], 600);
+  assert.deepEqual(h.out.at(-1), { t: 'clickAt', x: 0.5, y: 0.5, b: 'right' });
+
+  h = screen();
+  h.rec.start([P(1, 100, 50)], 0);
+  h.hold();
+  h.rec.move([P(1, 140, 50)], 520);
+  h.rec.move([P(1, 180, 60)], 540);
+  h.rec.end([], 560);
+  assert.deepEqual(h.out.map((m) => m.t), ['touch', 'downAt', 'pointAt', 'pointAt', 'upAt']);
+  assert.deepEqual(h.out[1], { t: 'downAt', x: 0.5, y: 0.5 });
+  assert.deepEqual(h.out.at(-1), { t: 'upAt', x: 0.9, y: 0.6 });
+});
+
+test('screen: two fingers scroll; a tap outside the picture does nothing', () => {
+  let h = screen();
+  h.rec.start([P(1, 50, 50), P(2, 90, 50)], 0);
+  for (let i = 1; i <= 5; i++) h.rec.move([P(1, 50, 50 - i * 10), P(2, 90, 50 - i * 10)], i * 16);
+  h.rec.end([], 100);
+  assert.ok(h.out.filter((m) => m.t === 'scroll').every((m) => m.dy < 0));
+  assert.equal(h.out.at(-1).t, 'scrollEnd');
+
+  h = screen();
+  h.rec.start([P(1, 300, 300)], 0);
+  h.rec.end([], 80);
+  assert.deepEqual(h.out, [{ t: 'touch' }]);
 });

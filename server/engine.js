@@ -153,6 +153,10 @@ export class Session {
       case 'up': return this.press(button(msg.b), false);
       case 'scroll': return this.scroll(num(msg.dx), num(msg.dy), num(msg.dt, 0, 1000), stamp(msg.ts));
       case 'scrollEnd': return this.scrollEnd(num(msg.vx, -20, 20), num(msg.vy, -20, 20));
+      case 'pointAt': return this.at(msg, (x, y) => this.pointAt(x, y));
+      case 'clickAt': return this.at(msg, (x, y) => this.clickAt(x, y, button(msg.b)));
+      case 'downAt': return this.at(msg, (x, y) => this.pressAt(x, y, true));
+      case 'upAt': return this.at(msg, (x, y) => this.pressAt(x, y, false));
       case 'zoom': return this.zoom(Math.trunc(num(msg.steps, -10, 10)));
       case 'swipe': return this.swipe(msg.dir);
       case 'type': return this.type(msg);
@@ -321,6 +325,33 @@ export class Session {
     r.x -= ix;
     r.y -= iy;
     this.send({ op: 'scroll', dx: ix, dy: iy });
+  }
+
+  // ── Touches on the streamed screen ─────────────────────────────────────
+  // x and y run 0…1 across the Mac's display; anything else is ignored.
+  at(msg, fn) {
+    if (!Number.isFinite(msg.x) || !Number.isFinite(msg.y)) return undefined;
+    return fn(clamp(msg.x, 0, 1), clamp(msg.y, 0, 1));
+  }
+
+  pointAt(x, y) {
+    this.flush('move');
+    this.send({ op: 'moveTo', x: Math.round(x * 1e4) / 1e4, y: Math.round(y * 1e4) / 1e4 });
+  }
+
+  // Two taps in the same spot double-click; a tap somewhere else starts over.
+  clickAt(x, y, b) {
+    const last = this.lastAt;
+    if (!last || Math.hypot(x - last.x, y - last.y) > 0.01) this.lastClick = null;
+    this.lastAt = { x, y };
+    this.pointAt(x, y);
+    this.movedSinceClick = 0;
+    this.click(b);
+  }
+
+  pressAt(x, y, down) {
+    this.pointAt(x, y);
+    this.press('left', down);
   }
 
   zoom(steps) {

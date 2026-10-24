@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { Session, Momentum, Playout, pointerGain } from '../server/engine.js';
 import { parseCombo, resolveKey } from '../server/keys.js';
 import { profileFor, publicProfile, findControl, PROFILES } from '../server/layouts.js';
-import { parseVolumeSettings } from '../server/backend.js';
+import { parseVolumeSettings, FrameReader } from '../server/backend.js';
 import { isAwdlActive } from '../server/net.js';
 
 function session() {
@@ -328,4 +328,32 @@ test("spots the AirDrop radio that makes Wi-Fi hitch", () => {
   assert.equal(isAwdlActive('awdl0: flags=8863<UP,BROADCAST,SMART,RUNNING> mtu 1500\n\tstatus: active\n'), true);
   assert.equal(isAwdlActive('awdl0: flags=8822<BROADCAST,SMART,SIMPLEX,MULTICAST> mtu 1500\n\tstatus: inactive\n'), false);
   assert.equal(isAwdlActive(''), false);
+});
+
+// ── The streamed screen ───────────────────────────────────────────────────
+
+test('screen frames come through whole, however the pipe splits them', () => {
+  const frames = [Buffer.from('first jpeg'), Buffer.alloc(70000, 7), Buffer.from('third')];
+  const wire = Buffer.concat(frames.flatMap((f) => [Buffer.from([0, 0, 0, 0].map((_, i) => (f.length >>> (24 - 8 * i)) & 255)), f]));
+  for (const size of [1, 3, 4096, wire.length]) {
+    const got = [];
+    const reader = new FrameReader((f) => got.push(Buffer.from(f)));
+    for (let i = 0; i < wire.length; i += size) reader.push(wire.subarray(i, i + size));
+    assert.deepEqual(got, frames, `chunks of ${size}`);
+  }
+});
+
+test('a tap on the streamed screen moves there, then clicks; same spot twice is a double-click', () => {
+  const h = session();
+  h.s.handle({ t: 'clickAt', x: 0.25, y: 0.5, b: 'left' });
+  h.advance(150);
+  h.s.handle({ t: 'clickAt', x: 0.251, y: 0.5, b: 'left' });
+  h.advance(150);
+  h.s.handle({ t: 'clickAt', x: 0.8, y: 0.2, b: 'left' });
+  assert.deepEqual(h.ops[0], { op: 'moveTo', x: 0.25, y: 0.5 });
+  assert.deepEqual(h.ops.filter((o) => o.op === 'button' && o.down).map((o) => o.n), [1, 2, 1]);
+  h.s.handle({ t: 'clickAt', x: 'left', y: NaN });
+  h.s.handle({ t: 'downAt', x: 3, y: -1 });
+  assert.deepEqual(h.ops.at(-2), { op: 'moveTo', x: 1, y: 0 }, 'clamped onto the screen');
+  assert.deepEqual(h.ops.at(-1), { op: 'button', b: 'left', down: true, n: 1 });
 });
