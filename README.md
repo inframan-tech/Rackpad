@@ -163,16 +163,16 @@ npx rackpad build-helper    recompile the native helper
 
 ```
  phone (web app)                         Mac
-┌──────────────────┐  WebSocket   ┌───────────────────┐  JSON lines  ┌─────────────────────┐
-│ gestures, each   │ ───────────▶ │ Node server       │ ───────────▶ │ RackpadHelper       │
-│ touch timestamped│  over HTTPS  │ playback at the   │  move/click/ │ (Swift): CGEvent    │
-│ live typing diff │  or HTTP     │ finger's pace,    │  scroll/key/ │ input, cursor glow  │
+┌──────────────────┐  WebRTC      ┌───────────────────┐  JSON lines  ┌─────────────────────┐
+│ gestures, each   │  data channel│ Node server       │ ───────────▶ │ RackpadHelper       │
+│ touch timestamped│ ───────────▶ │ playback at the   │  move/click/ │ (Swift): CGEvent    │
+│ live typing diff │  (UDP)       │ finger's pace,    │  scroll/key/ │ input, cursor glow  │
 │ click wheel      │ ◀─────────── │ acceleration,     │  text/media  │ and click ripples,  │
 │ keeps link warm  │  front app,  │ momentum, layouts │ ◀─────────── │ front-app watcher   │
 │                  │  volume      │                   │  front app   │                     │
 │ <video> of the   │  WebRTC      │ one WebRTC link   │  H.264 on    │ ScreenCaptureKit →  │
 │ Mac's screen     │ ◀─────────── │ per phone         │ ◀─────────── │ VideoToolbox H.264  │
-└──────────────────┘  (RTP/UDP)   └───────────────────┘  fd 3        └─────────────────────┘
+└──────────────────┘  video track └───────────────────┘  fd 3        └─────────────────────┘
 ```
 
 - `web/` is the phone app: plain ES modules, no build step. Gesture
@@ -183,13 +183,17 @@ npx rackpad build-helper    recompile the native helper
   `Playout` learns the network's quickest trip and how much later most
   messages arrive, and plays every movement that far behind your finger,
   spread evenly across the time it took. On calm Wi-Fi that's a few ms.
-- `server/rtc.js` sends the screen over WebRTC with
-  [libdatachannel](https://github.com/paullouisageneau/libdatachannel): a
-  send-only H.264 track per phone, lost packets resent, a fresh keyframe when
-  a phone joins or loses the picture, and a request for zero playout delay so
-  nothing buffers between the Mac and your finger. The phone's offer and
-  answer ride the WebSocket. There is no fallback: if WebRTC can't connect,
-  the phone says so rather than streaming JPEGs.
+- `server/rtc.js` gives each phone one WebRTC link, straight across the
+  Wi-Fi, made with
+  [libdatachannel](https://github.com/paullouisageneau/libdatachannel). A
+  data channel carries touches, keys and pings over UDP, and a send-only
+  H.264 track carries the screen: lost packets resent, a fresh keyframe when
+  a phone starts watching or loses the picture, and a request for zero
+  playout delay so nothing buffers between the Mac and your finger. Setting
+  the link up is two HTTP requests: the phone asks for the Mac's offer
+  (`POST /rtc`, with its pairing code) and sends back its answer
+  (`POST /rtc/answer`). There's no WebSocket, and no JPEG fallback: if no
+  picture comes, the phone says so.
 - `server/tls.js` runs the local certificate authority and renews the Mac's
   certificate when it joins a new network.
 - `helper/RackpadHelper.swift` posts real mouse, scroll, keyboard and
@@ -223,9 +227,11 @@ them: `npm i -D playwright && npx playwright install chromium`.
   the app you run Rackpad from. If it's on but nothing happens, remove that
   app from the Accessibility list with − and add it again.
 - **Security:** a phone needs the pairing code from the QR link to connect,
-  and the pairing page only opens on the Mac itself. Over plain HTTP someone
-  on the same network could sniff the code, so use the secure connection on
-  networks you don't trust, and `rackpad reset-token` to change the code.
+  and the pairing page only opens on the Mac itself. Touches, keys and the
+  screen always travel encrypted (WebRTC uses DTLS), but over plain HTTP
+  someone on the same network could sniff the pairing code as the phone
+  connects. Use the secure connection on networks you don't trust, and
+  `rackpad reset-token` to change the code.
 
 ## Roadmap
 

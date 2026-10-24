@@ -1,11 +1,11 @@
-// The screen's WebRTC link: the frames the helper writes, and the offer the
-// Mac makes to a phone.
+// The WebRTC link to each phone: the frames the helper writes, and the offer
+// the Mac makes.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { parseFrame, readFrames } from '../server/backend.js';
-import { ScreenPeer, wantsKeyframe } from '../server/rtc.js';
+import { PhoneLink, wantsKeyframe } from '../server/rtc.js';
 
 const nalTypes = (au) => {
   const types = [];
@@ -41,18 +41,15 @@ test('a PLI or FIR from the phone asks for a keyframe; a receiver report does no
   assert.equal(wantsKeyframe(Buffer.concat([rr, fir])), true, 'inside a compound packet');
 });
 
-test('the Mac offers a send-only H.264 track that asks for no playout delay', async () => {
-  const signals = [];
-  const peer = new ScreenPeer({ signal: (m) => signals.push(m), keyframe: () => {} });
-  const end = Date.now() + 2000;
-  while (!signals.some((m) => m.type === 'offer') && Date.now() < end) await new Promise((r) => setTimeout(r, 10));
-  peer.close();
-  const offer = signals.find((m) => m.type === 'offer');
-  assert.ok(offer, 'an offer');
-  assert.equal(offer.t, 'rtc');
-  assert.match(offer.sdp, /m=video .* 96\r?\n/);
-  assert.match(offer.sdp, /a=sendonly/);
-  assert.match(offer.sdp, /a=rtpmap:96 H264\/90000/);
-  assert.match(offer.sdp, /packetization-mode=1/);
-  assert.match(offer.sdp, /a=extmap:\d+ http:\/\/www\.webrtc\.org\/experiments\/rtp-hdrext\/playout-delay/);
+test('the Mac offers one link: a data channel and a send-only H.264 track with no playout delay', async () => {
+  const link = new PhoneLink({});
+  const sdp = await link.offer();
+  link.close();
+  assert.match(sdp, /m=video \d+ UDP\/TLS\/RTP\/SAVPF 96\r?\n/);
+  assert.match(sdp, /a=sendonly/);
+  assert.match(sdp, /a=rtpmap:96 H264\/90000/);
+  assert.match(sdp, /packetization-mode=1/);
+  assert.match(sdp, /a=extmap:\d+ http:\/\/www\.webrtc\.org\/experiments\/rtp-hdrext\/playout-delay/);
+  assert.match(sdp, /m=application \d+ UDP\/DTLS\/SCTP webrtc-datachannel/);
+  assert.match(sdp, /a=candidate:/, "the Mac's addresses are in the offer: no trickling needed");
 });

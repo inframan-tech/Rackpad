@@ -1,8 +1,15 @@
-// The screen goes to the phone as WebRTC video: a send-only H.264 track per
-// watching phone, fed by the helper's hardware encoder. libdatachannel turns
-// each access unit into RTP, resends what Wi-Fi drops (NACK), keeps the
-// phone's clock in step (RTCP sender reports), and sends it all over
-// DTLS-SRTP straight to the phone. Signaling rides the existing WebSocket.
+// Each phone talks to the Mac over one WebRTC link, straight across the
+// Wi-Fi with no server in between:
+//
+// - a data channel carries everything the phone and Mac say to each other
+//   (touches, keys, pings, the app in front), over UDP;
+// - a send-only H.264 video track carries the screen, fed by the helper's
+//   hardware encoder. libdatachannel turns each access unit into RTP, resends
+//   what Wi-Fi drops (NACK), keeps the phone's clock in step (RTCP sender
+//   reports), and encrypts it all (DTLS-SRTP).
+//
+// Setting the link up takes two plain HTTP requests (see server.js): the Mac
+// makes the offer, the phone answers.
 
 import ndc from 'node-datachannel';
 
@@ -17,6 +24,14 @@ const PLAYOUT_DELAY_URI = 'http://www.webrtc.org/experiments/rtp-hdrext/playout-
 const PLAYOUT_DELAY_ID = 6;
 const MAX_FRAGMENT = 1200; // bytes of H.264 per RTP packet, safely under Wi-Fi's MTU
 const NACK_HISTORY = 2048; // packets kept for resending: a few keyframes' worth
+const GATHER_MS = 1000; // the Mac's own addresses are known at once; don't wait on slow ones
+const DROPPED_MS = 6000; // a link that drops gets this long to come back
+export const MAX_MESSAGE = 64 * 1024;
+
+/** Stops libdatachannel's threads, which otherwise keep Node running: after the last link closes. */
+export function shutdownLinks() {
+  ndc.cleanup();
+}
 
 /** True when an RTCP packet asks for a fresh keyframe (PLI or FIR). */
 export function wantsKeyframe(buf) {
@@ -29,38 +44,56 @@ export function wantsKeyframe(buf) {
   return false;
 }
 
-let ssrcs = 0x52430000; // "RC": one SSRC per peer, never reused within a run
+// A throw inside a libdatachannel callback would abort the whole process,
+// so every callback reports its errors instead.
+const guard = (log, fn) => (...args) => {
+  try {
+    fn(...args);
+  } catch (err) {
+    log(`link: ${err.stack ?? err}`);
+  }
+};
+
+let ssrcs = 0x52430000; // "RC": one SSRC per link, never reused within a run
 
 /**
- * One phone's video link. `signal(msg)` sends to that phone's WebSocket;
- * `keyframe()` asks the encoder for a fresh keyframe; `state(s)` reports
- * 'connected', 'failed' or 'closed'.
+ * One phone's link. `onOpen()` fires when the phone can talk, `onMessage(msg)`
+ * for each JSON message, `onClose()` once when it's gone for good;
+ * `keyframe()` asks the encoder for a fresh keyframe.
  */
-export class ScreenPeer {
-  constructor({ signal, keyframe, state = () => {}, log = () => {} }) {
-    this.signal = signal;
+export class PhoneLink {
+  constructor({ onOpen = () => {}, onMessage = () => {}, onClose = () => {}, keyframe = () => {}, log = () => {}, onError = console.error }) {
+    const safe = (fn) => guard(onError, fn);
+    this.onOpen = onOpen;
+    this.onClose = onClose;
     this.keyframe = keyframe;
-    this.state = state;
     this.log = log;
-    this.open = false;
+    this.closed = false;
+    this.watching = false;
+    this.videoOpen = false;
     this.needKey = true;
     this.base = null; // first frame's pts, so RTP time starts at the config's random offset
+    this.dropTimer = null;
     const ssrc = ++ssrcs >>> 0;
 
-    this.pc = new ndc.PeerConnection('rackpad', { iceServers: [] });
-    this.pc.onLocalDescription((sdp, type) => this.signal({ t: 'rtc', type: String(type).toLowerCase(), sdp }));
-    this.pc.onLocalCandidate((candidate, mid) => this.signal({ t: 'rtc', candidate, mid }));
-    this.pc.onStateChange((s) => {
-      this.log(`screen link ${s}`);
-      if (s === 'connected' || s === 'failed' || s === 'closed') this.state(s);
+    this.pc = new ndc.PeerConnection('rackpad', { iceServers: [], disableAutoNegotiation: true, maxMessageSize: MAX_MESSAGE });
+    this.gathered = new Promise((resolve) => {
+      this.pc.onGatheringStateChange(safe((s) => s === 'complete' && resolve()));
+      setTimeout(resolve, GATHER_MS);
     });
+    this.pc.onStateChange(safe((s) => {
+      this.log(`link ${s}`);
+      clearTimeout(this.dropTimer);
+      if (s === 'failed' || s === 'closed') this.close();
+      else if (s === 'disconnected') this.dropTimer = setTimeout(() => this.close(), DROPPED_MS);
+    }));
 
+    // The screen.
     const video = new ndc.Video('screen', 'SendOnly');
     video.addH264Codec(PAYLOAD_TYPE, H264_FMTP);
     video.addSSRC(ssrc, 'rackpad', 'rackpad', 'screen');
     video.parseSdpLine(`a=extmap:${PLAYOUT_DELAY_ID} ${PLAYOUT_DELAY_URI}`);
     this.track = this.pc.addTrack(video);
-
     this.rtp = new ndc.RtpPacketizationConfig(ssrc, 'rackpad', PAYLOAD_TYPE, CLOCK_RATE);
     this.rtp.playoutDelayId = PLAYOUT_DELAY_ID;
     this.rtp.playoutDelayMin = 0;
@@ -70,36 +103,72 @@ export class ScreenPeer {
     packetizer.addToChain(new ndc.RtcpSrReporter(this.rtp));
     packetizer.addToChain(new ndc.RtcpNackResponder(NACK_HISTORY));
     this.track.setMediaHandler(packetizer);
-    this.track.onOpen(() => {
-      this.open = true;
-      this.needKey = true;
-      this.keyframe();
-    });
-    this.track.onClosed(() => { this.open = false; });
+    this.track.onOpen(safe(() => {
+      this.videoOpen = true;
+      if (this.watching) this.freshPicture();
+    }));
     // Whatever RTCP the chain leaves over lands here: the phone's "I lost
     // the picture, send a keyframe" (PLI, FIR).
-    this.track.onMessage((msg) => {
-      if (wantsKeyframe(msg)) {
-        this.needKey = true;
-        this.keyframe();
+    this.track.onMessage(safe((msg) => {
+      if (this.watching && wantsKeyframe(msg)) this.freshPicture();
+    }));
+
+    // Everything else.
+    this.dc = this.pc.createDataChannel('rackpad');
+    this.dc.onOpen(safe(() => this.onOpen()));
+    this.dc.onClosed(safe(() => this.close()));
+    this.dc.onMessage(safe((data) => {
+      if (typeof data !== 'string' || data.length > MAX_MESSAGE) return;
+      let msg;
+      try {
+        msg = JSON.parse(data);
+      } catch {
+        return;
       }
-    });
+      if (msg && typeof msg === 'object') onMessage(msg);
+    }));
+
     this.pc.setLocalDescription(); // the offer
   }
 
-  /** The phone's answer or one of its ICE candidates. */
-  remote(msg) {
+  /** The offer, with the Mac's addresses in it. */
+  async offer() {
+    await this.gathered;
+    return this.pc.localDescription()?.sdp ?? null;
+  }
+
+  /** The phone's answer, with its addresses in it. */
+  answer(sdp) {
+    this.pc.setRemoteDescription(sdp, 'answer');
+  }
+
+  get open() {
+    return !this.closed && this.dc.isOpen();
+  }
+
+  send(msg) {
+    if (!this.open) return;
     try {
-      if (msg.type === 'answer' && typeof msg.sdp === 'string') this.pc.setRemoteDescription(msg.sdp, 'answer');
-      else if (typeof msg.candidate === 'string' && msg.candidate) this.pc.addRemoteCandidate(msg.candidate, String(msg.mid ?? 'screen'));
+      this.dc.sendMessage(JSON.stringify(msg));
     } catch (err) {
-      this.log(`screen link: ${err.message}`);
+      this.log(`link: ${err.message}`);
     }
   }
 
-  /** Sends one encoded frame; until a keyframe arrives there's nothing the phone could decode. */
-  send({ key, pts, au }) {
-    if (!this.open) return;
+  /** Start or stop sending the screen. It starts on a keyframe. */
+  watch(on) {
+    this.watching = on;
+    if (on && this.videoOpen) this.freshPicture();
+  }
+
+  freshPicture() {
+    this.needKey = true;
+    this.keyframe();
+  }
+
+  /** One encoded frame; until a keyframe arrives there's nothing the phone could decode. */
+  frame({ key, pts, au }) {
+    if (!this.watching || !this.videoOpen || this.closed) return;
     if (this.needKey && !key) return;
     this.needKey = false;
     if (this.base === null) this.base = pts;
@@ -107,13 +176,17 @@ export class ScreenPeer {
     try {
       this.track.sendMessageBinary(au);
     } catch (err) {
-      this.log(`screen link: ${err.message}`);
+      this.log(`link: ${err.message}`);
     }
   }
 
   close() {
-    this.open = false;
-    try { this.track.close(); } catch {}
-    try { this.pc.close(); } catch {}
+    if (this.closed) return;
+    this.closed = true;
+    clearTimeout(this.dropTimer);
+    for (const c of [this.dc, this.track, this.pc]) {
+      try { c.close(); } catch {}
+    }
+    this.onClose();
   }
 }

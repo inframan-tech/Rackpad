@@ -288,22 +288,31 @@ test('the Screen view streams the Mac over WebRTC, and a tap clicks right there'
   await waitFor(() => opsOf('screen').some((o) => o.on === false) && opsOf('screenOff').some((o) => o.on === false));
 });
 
-test('without WebRTC there is no picture, and it says so: no JPEG', { skip }, async () => {
-  await page.evaluate(() => {
-    window.realPeerConnection = window.RTCPeerConnection;
-    window.RTCPeerConnection = undefined;
-  });
+test('no picture means an error, not a JPEG stream', { skip }, async () => {
+  const fakeScreen = backend.fakeScreen;
+  backend.fakeScreen = () => {}; // a Mac whose video never arrives
+  await page.evaluate(() => (window.rackpad.screenView.connectMs = 500));
   await show('screen');
   await page.waitForFunction(() => !document.querySelector('#screen-fail').hidden);
-  assert.match(await page.textContent('#screen-fail'), /not going to stream over JPEG — get the hell out\..*no WebRTC/s);
+  assert.match(await page.textContent('#screen-fail'), /not going to stream over JPEG — get the hell out\..*No picture/s);
   await waitFor(() => opsOf('screen').at(-1)?.on === false);
 
-  // With WebRTC back, Try again brings the picture.
-  await page.evaluate(() => (window.RTCPeerConnection = window.realPeerConnection));
+  // With video flowing again, Try again brings the picture.
+  backend.fakeScreen = fakeScreen;
   await page.locator('#screen-retry').click();
   await page.waitForFunction(() => document.querySelector('#screen-video.playing')?.videoWidth > 0, null, { timeout: 8000 });
   assert.equal(await page.isHidden('#screen-fail'), true);
+  await page.evaluate(() => (window.rackpad.screenView.connectMs = 10000));
   await show('pad');
+});
+
+test('everything rides WebRTC: the phone has no WebSocket at all', { skip }, async () => {
+  assert.equal(await page.evaluate(() => window.rackpad.conn.pc?.connectionState), 'connected');
+  assert.equal(await page.evaluate(() => window.rackpad.conn.dc?.readyState), 'open');
+  const res = await fetch(`http://127.0.0.1:${port}/rtc?k=nope`, { method: 'POST' });
+  assert.equal(res.status, 401, 'a wrong pairing code gets no offer');
+  assert.equal((await fetch(`http://127.0.0.1:${port}/ws?k=${TOKEN}`)).status, 404, 'no WebSocket endpoint');
+  assert.equal(server.server.listenerCount('upgrade'), 0);
 });
 
 test('sideways, the whole phone is the trackpad', { skip }, async () => {

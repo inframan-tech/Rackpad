@@ -1,14 +1,14 @@
-// The Mac's screen on the phone, over WebRTC: hardware H.264 from the Mac,
-// decoded in hardware here, each frame shown the moment it lands. There's no
-// fallback. If WebRTC can't connect, the screen view says so and why.
-// Touches act right where they land on the picture.
+// The Mac's screen on the phone: the video track of the WebRTC link (see
+// connection.js), hardware H.264 from the Mac decoded in hardware here, each
+// frame shown the moment it lands. There's no fallback. If no picture comes,
+// the screen view says so and why. Touches act right where they land on the
+// picture.
 
 import { ScreenRecognizer } from './gestures.js';
 import { bindSurface, onTap } from './touch.js';
 
 const MAX_WIDTH = 1920;
 const CONNECT_MS = 10000; // no picture by then: give up and say why
-const DROPPED_MS = 5000; // a link that drops gets this long to come back
 
 export class ScreenView {
   constructor({ root, send, feel }) {
@@ -21,9 +21,9 @@ export class ScreenView {
     this.offBtn = root.querySelector('#screen-off');
     this.watching = false;
     this.dark = false;
-    this.pc = null;
-    this.signals = Promise.resolve(); // signaling, strictly in order
+    this.stream = null;
     this.timer = null;
+    this.connectMs = CONNECT_MS;
     bindSurface(this.wrap, new ScreenRecognizer(send, { at: (p) => this.at(p), feel }));
     onTap(this.offBtn, () => {
       this.dark = !this.dark;
@@ -36,19 +36,25 @@ export class ScreenView {
     this.video.addEventListener('resize', () => this.showing());
   }
 
+  // The link's video track, or null while there's no link.
+  attach(stream) {
+    this.stream = stream;
+    if (this.watching) this.play();
+  }
+
   // Start or stop the stream; `force` asks again (after a reconnect).
   watch(on, force = false) {
     if (on === this.watching && !force) return;
     this.watching = on;
-    this.hangUp();
+    clearTimeout(this.timer);
     this.failBox.hidden = true;
+    this.video.classList.remove('playing');
     if (on) {
-      if (typeof RTCPeerConnection !== 'function') {
-        this.fail('This browser has no WebRTC.');
-        return;
-      }
       this.say('Connecting to the screen…', true);
-      this.wait(CONNECT_MS, 'No picture after 10 seconds.');
+      this.timer = setTimeout(() => this.fail(this.stream ? `No picture after ${this.connectMs / 1000} seconds.` : "The WebRTC link to your Mac isn't up."), this.connectMs);
+      this.play();
+    } else {
+      this.video.srcObject = null;
     }
     // About as many pixels as the phone has across, within reason.
     const px = Math.max(screen.width, screen.height) * Math.min(window.devicePixelRatio || 1, 3);
@@ -56,45 +62,13 @@ export class ScreenView {
     if (on && this.dark) this.send({ t: 'screenOff', on: true });
   }
 
-  // WebRTC signaling from the Mac: its offer, its ICE candidates, or an error.
-  rtc(msg) {
-    if (!this.watching) return;
-    if (msg.error) {
-      this.fail(msg.error);
-      return;
-    }
-    this.signals = this.signals.then(() => this.signal(msg)).catch((err) => this.fail(`WebRTC: ${err.message}`));
-  }
-
-  async signal(msg) {
-    if (!this.watching) return;
-    if (msg.type === 'offer') {
-      this.closePeer();
-      const pc = new RTCPeerConnection({ iceServers: [] });
-      this.pc = pc;
-      pc.ontrack = (e) => {
-        // Show frames as they come: no smoothing buffer between the Mac and your finger.
-        try { e.receiver.jitterBufferTarget = 0; } catch {}
-        try { e.receiver.playoutDelayHint = 0; } catch {}
-        this.video.srcObject = e.streams[0] ?? new MediaStream([e.track]);
-        this.video.play().catch(() => {});
-      };
-      pc.onicecandidate = (e) => {
-        if (e.candidate?.candidate) this.send({ t: 'rtc', candidate: e.candidate.candidate, mid: e.candidate.sdpMid });
-      };
-      pc.onconnectionstatechange = () => {
-        if (pc !== this.pc) return;
-        const s = pc.connectionState;
-        if (s === 'failed') this.fail("WebRTC couldn't reach your Mac. Is something on this Wi-Fi blocking UDP?");
-        else if (s === 'disconnected') this.wait(DROPPED_MS, 'The video link to your Mac dropped.');
-        else if (s === 'connected' && this.video.videoWidth) this.showing();
-      };
-      await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
-      await pc.setLocalDescription(await pc.createAnswer());
-      this.send({ t: 'rtc', type: 'answer', sdp: pc.localDescription.sdp });
-    } else if (msg.candidate && this.pc) {
-      await this.pc.addIceCandidate({ candidate: msg.candidate, sdpMid: msg.mid ?? '0' });
-    }
+  // Hand the track to the video afresh, so its first frame says the picture is up.
+  play() {
+    this.video.classList.remove('playing');
+    this.video.srcObject = null;
+    if (!this.stream) return;
+    this.video.srcObject = this.stream;
+    this.video.play().catch(() => {});
   }
 
   // The picture is up.
@@ -105,42 +79,26 @@ export class ScreenView {
     this.video.classList.add('playing');
   }
 
-  // Unless the picture shows within `ms`, fail with `reason`.
-  wait(ms, reason) {
-    clearTimeout(this.timer);
-    this.timer = setTimeout(() => this.fail(reason), ms);
-  }
-
   fail(reason) {
     if (!this.watching) return;
     this.watching = false;
-    this.hangUp();
+    clearTimeout(this.timer);
+    this.video.srcObject = null;
+    this.video.classList.remove('playing');
     this.send({ t: 'screen', on: false });
     this.msg.hidden = true;
     this.failWhy.textContent = reason;
     this.failBox.hidden = false;
   }
 
-  hangUp() {
-    clearTimeout(this.timer);
-    this.closePeer();
-  }
-
-  closePeer() {
-    this.pc?.close();
-    this.pc = null;
-    this.video.classList.remove('playing');
-    this.video.srcObject = null;
-  }
-
   // What the Mac says about the capture itself.
   status({ on, error }) {
     if (!this.watching) return;
     if (error === 'permission') {
-      this.hangUp();
+      clearTimeout(this.timer);
       this.say('Allow screen recording on your Mac: System Settings → Privacy & Security → Screen & System Audio Recording → switch on the app Rackpad runs in (Terminal, Ghostty…). Then come back here.');
     } else if (error) {
-      this.hangUp();
+      clearTimeout(this.timer);
       this.say(`The screen can't be shown: ${error}`);
     } else if (!on) {
       this.say('The screen stopped.');

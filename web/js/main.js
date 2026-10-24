@@ -126,8 +126,7 @@ function deviceName() {
 }
 
 function start() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const conn = new Connection(`${proto}://${location.host}/ws?k=${encodeURIComponent(token)}&name=${encodeURIComponent(deviceName())}`);
+  const conn = new Connection({ token, name: deviceName() });
   const send = (msg) => conn.send(msg);
   // Any touch anywhere wakes the link up (see connection.js).
   document.addEventListener('touchstart', () => conn.use(), { capture: true, passive: true });
@@ -199,6 +198,7 @@ function start() {
   });
   const wheel = new WheelView({ root: $('[data-view="remote"]'), send, feel });
   const screenView = new ScreenView({ root: $('[data-view="screen"]'), send, feel });
+  conn.addEventListener('track', (e) => screenView.attach(e.detail));
   // The stream runs only while the Screen view is on screen.
   const watchScreen = (force = false) => screenView.watch(app.dataset.current === 'screen' && document.visibilityState === 'visible', force);
   document.addEventListener('visibilitychange', () => watchScreen());
@@ -493,6 +493,11 @@ function start() {
       }
     } else if (s === 'closed') {
       name = 'Reconnecting…';
+      note = conn.reason ?? '';
+    } else if (s === 'unsupported') {
+      name = "Can't connect";
+      note = conn.reason ?? '';
+      level = 'bad';
     } else if (s === 'unauthorized') {
       name = 'Not paired';
       level = 'bad';
@@ -551,9 +556,6 @@ function start() {
       case 'screen':
         screenView.status(msg);
         break;
-      case 'rtc':
-        screenView.rtc(msg);
-        break;
       case 'screenOff':
         screenView.screenOff(msg.on);
         break;
@@ -582,5 +584,5 @@ function start() {
   applyAll();
   orient();
   conn.connect();
-  window.rackpad = { conn, settings, showView }; // handy from the console
+  window.rackpad = { conn, settings, showView, screenView }; // handy from the console
 }
