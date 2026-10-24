@@ -16,6 +16,11 @@ const HELPER_BIN = path.join(CONFIG_DIR, 'bin', 'rackpad-helper');
 
 const DEFAULT_APP = { bundleId: 'com.apple.finder', name: 'Finder' };
 
+// For --verbose logs: every command, but never what was typed.
+export function describeOp(op) {
+  return JSON.stringify(op.op === 'text' ? { ...op, s: `<${[...op.s].length} chars>` } : op);
+}
+
 class Backend extends EventEmitter {
   constructor() {
     super();
@@ -45,6 +50,7 @@ export class DryRunBackend extends Backend {
     this.status = { kind: 'dry-run', ready: true, trusted: true, error: null };
   }
 
+
   start() {}
 
   send(op) {
@@ -55,7 +61,7 @@ export class DryRunBackend extends Backend {
       if (op.k === 'voldown') this.level = Math.max(0, this.level - 6.25);
       if (op.k === 'mute') this.muted = !this.muted;
     }
-    if (this.verbose) this.log(`→ ${JSON.stringify(op)}`);
+    if (this.verbose) this.log(`→ ${describeOp(op)}`);
   }
 
   async volume() {
@@ -66,9 +72,10 @@ export class DryRunBackend extends Backend {
 }
 
 export class NativeBackend extends Backend {
-  constructor({ log = () => {}, binPath = HELPER_BIN } = {}) {
+  constructor({ log = () => {}, verbose = false, binPath = HELPER_BIN } = {}) {
     super();
     this.log = log;
+    this.verbose = verbose;
     this.binPath = binPath;
     this.proc = null;
     this.restarts = 0;
@@ -130,6 +137,7 @@ export class NativeBackend extends Backend {
   send(op) {
     if (!this.proc || !this.proc.stdin.writable) return;
     this.proc.stdin.write(`${JSON.stringify(op)}\n`);
+    if (this.verbose) this.log(`→ ${describeOp(op)}`);
   }
 
   volume() {

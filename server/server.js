@@ -1,16 +1,20 @@
 // HTTP + WebSocket server: serves the phone app, authenticates phones by
-// their pairing token, and connects each one to an input Session.
+// their pairing token, and connects each one to an input Session. With a
+// certificate (see tls.js) the same app is served over HTTPS too.
 
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { WebSocketServer } from 'ws';
 import QRCode from 'qrcode';
 import { Session } from './engine.js';
 import { profileFor, publicProfile } from './layouts.js';
 import { tokensEqual } from './config.js';
 import { renderPairPage } from './pairpage.js';
+import { awdlActive } from './net.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const WEB_DIR = path.resolve(HERE, '..', 'web');
@@ -27,9 +31,13 @@ const MIME = {
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 
-export function createRackpadServer({ backend, token, macName, version, pairing, log = () => {} }) {
+// Third-party browser code, served straight from node_modules.
+const VENDOR = new Map([['/vendor/jsQR.js', createRequire(import.meta.url).resolve('jsqr')]]);
+
+export function createRackpadServer({ backend, token, macName, version, pairing, tls = null, log = () => {} }) {
   const clients = new Map(); // ws → { session, name }
   let lastContextKey = null;
+  let securePort = null;
 
   const context = () => {
     const app = backend.app ?? {};
@@ -51,13 +59,15 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
   });
   backend.on('status', (status) => broadcast({ t: 'status', backend: status }));
 
-  const server = http.createServer((req, res) => {
+  const onRequest = (req, res) => {
     handleHttp(req, res).catch((err) => {
       log(`HTTP error: ${err.stack ?? err}`);
       if (!res.headersSent) res.writeHead(500);
       res.end();
     });
-  });
+  };
+  const server = http.createServer(onRequest);
+  const secureServer = tls ? https.createServer({ key: tls.key, cert: tls.cert }, onRequest) : null;
 
   async function handleHttp(req, res) {
     const url = new URL(req.url, 'http://local');
@@ -65,13 +75,31 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
 
     if (p === '/manifest.webmanifest') return sendManifest(res, url.searchParams.get('k'));
 
+    // The certificate authority, for the phone to install once (it's public:
+    // anyone may see it, and it can only vouch for local names).
+    if (p === '/rackpad.crt' && tls) {
+      res.writeHead(200, {
+        'Content-Type': 'application/x-x509-ca-cert',
+        'Content-Disposition': 'attachment; filename="Rackpad.crt"',
+        'Cache-Control': 'no-store',
+      });
+      return res.end(tls.caDer);
+    }
+    // Answered over HTTPS only once the phone trusts the certificate, so the
+    // plain page can ask whether the secure one is ready.
+    if (p === '/secure-check') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' });
+      return res.end(JSON.stringify({ ok: true, secure: !!req.socket.encrypted }));
+    }
+
     // The pairing page shows the token, so only the Mac itself may open it.
     // The Host check stops DNS-rebinding pages in the Mac's browser too.
     if (p === '/pair' || p.startsWith('/api/')) {
       if (!isLocalRequest(req)) return send(res, 403, 'text/plain', 'The pairing page is only available on the Mac itself.');
       if (p === '/pair') {
         const qr = await QRCode.toString(pairing.primary, { type: 'svg', margin: 0, errorCorrectionLevel: 'M' });
-        return send(res, 200, MIME['.html'], renderPairPage({ qr, pairing, macName, version, dryRun: backend.status.kind === 'dry-run' }));
+        const secureQr = pairing.secure && securePort ? await QRCode.toString(pairing.secure, { type: 'svg', margin: 0, errorCorrectionLevel: 'M' }) : null;
+        return send(res, 200, MIME['.html'], renderPairPage({ qr, secureQr, pairing, macName, version, dryRun: backend.status.kind === 'dry-run' }));
       }
       if (p === '/api/status') {
         return sendJson(res, {
@@ -79,6 +107,7 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
           phones: [...clients.values()].map((c) => c.name),
           app: { name: backend.app?.name, bundleId: backend.app?.bundleId },
           profile: profileFor(backend.app).id,
+          awdl: backend.status.kind === 'native' && awdlActive(),
         });
       }
       if (p === '/api/simulate-app' && req.method === 'POST' && backend.status.kind === 'dry-run') {
@@ -90,7 +119,20 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
     }
 
     if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'text/plain', 'Method not allowed');
-    return serveStatic(res, p === '/' ? '/index.html' : p);
+    if (p === '/' || p === '/index.html') return serveIndex(res, url.searchParams.get('k'));
+    if (VENDOR.has(p)) return sendFile(res, VENDOR.get(p));
+    return serveStatic(res, p);
+  }
+
+  // The page links the manifest with the phone's token already in it: iOS
+  // reads the manifest as the page loads, and its start_url is where the Home
+  // Screen icon opens, in storage of its own that can't see Safari's.
+  function serveIndex(res, k) {
+    fs.readFile(path.join(WEB_DIR, 'index.html'), 'utf8', (err, html) => {
+      if (err) return send(res, 500, 'text/plain', 'index.html is missing');
+      const authed = typeof k === 'string' && tokensEqual(k, token);
+      send(res, 200, MIME['.html'], authed ? html.replace('href="/manifest.webmanifest"', `href="/manifest.webmanifest?k=${encodeURIComponent(k)}"`) : html);
+    });
   }
 
   function sendManifest(res, k) {
@@ -99,12 +141,15 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
       name: 'Rackpad',
       short_name: 'Rackpad',
       description: `Trackpad, keyboard and remote for ${macName}`,
-      start_url: authed ? `/?k=${encodeURIComponent(k)}` : '/',
+      // Without a token, start_url defaults to the address of the page that
+      // linked the manifest, which carries the token if the page had one.
+      ...(authed ? { start_url: `/?k=${encodeURIComponent(k)}` } : {}),
       scope: '/',
       display: 'standalone',
-      orientation: 'portrait',
-      background_color: '#05060f',
-      theme_color: '#05060f',
+      display_override: ['fullscreen', 'standalone'],
+      orientation: 'any', // sideways, the whole phone is the trackpad
+      background_color: '#000000',
+      theme_color: '#000000',
       icons: [
         { src: '/icons/icon-192.png', sizes: '192x192', type: 'image/png' },
         { src: '/icons/icon-512.png', sizes: '512x512', type: 'image/png' },
@@ -116,7 +161,7 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
 
-  server.on('upgrade', (req, socket, head) => {
+  const onUpgrade = (req, socket, head) => {
     const url = new URL(req.url, 'http://local');
     if (url.pathname !== '/ws') return socket.destroy();
     wss.handleUpgrade(req, socket, head, (ws) => {
@@ -127,20 +172,24 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
       }
       onClient(ws, req);
     });
-  });
+  };
+  server.on('upgrade', onUpgrade);
+  secureServer?.on('upgrade', onUpgrade);
 
   function onClient(ws, req) {
     const name = String(new URL(req.url, 'http://local').searchParams.get('name') ?? 'Phone').slice(0, 40);
     const session = new Session({
       backend,
       onVolume: (v) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ t: 'volume', ...v })),
+      onStats: backend.verbose ? (st) => log(`glide: ${st.moves} moves in 3s, ${st.late} late, playing ${st.buffer} ms behind`) : null,
     });
     clients.set(ws, { session, name });
-    log(`📱 ${name} connected (${req.socket.remoteAddress})`);
+    log(`📱 ${name} connected (${req.socket.remoteAddress}${platformOf(req.headers['user-agent'])})`);
 
     ws.isAlive = true;
     ws.on('pong', () => (ws.isAlive = true));
-    ws.send(JSON.stringify({ t: 'welcome', version, mac: { name: macName }, backend: backend.status, ...context() }));
+    const secure = securePort ? { port: securePort, ca: tls.caName } : null;
+    ws.send(JSON.stringify({ t: 'welcome', version, mac: { name: macName }, backend: backend.status, secure, ...context() }));
 
     ws.on('message', (data, isBinary) => {
       if (isBinary) return;
@@ -179,25 +228,46 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
   }, 15000);
   heartbeat.unref();
 
+  const listenOn = (srv, port, host) =>
+    new Promise((resolve, reject) => {
+      srv.once('error', reject);
+      srv.listen(port, host, () => {
+        srv.off('error', reject);
+        resolve(srv.address().port);
+      });
+    });
+
   return {
     server,
+    secureServer,
     clients,
     listen(port, host = '0.0.0.0') {
-      return new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(port, host, () => {
-          server.off('error', reject);
-          resolve(server.address().port);
-        });
-      });
+      return listenOn(server, port, host);
+    },
+    async listenSecure(port, host = '0.0.0.0') {
+      securePort = await listenOn(secureServer, port, host);
+      return securePort;
+    },
+    // A renewed certificate (the Mac's addresses changed) takes effect for new connections.
+    setTls(next) {
+      secureServer?.setSecureContext({ key: next.key, cert: next.cert });
     },
     close() {
       clearInterval(heartbeat);
       for (const ws of clients.keys()) ws.terminate();
       wss.close();
-      return new Promise((resolve) => server.close(() => resolve()));
+      const closing = [server, secureServer].filter((srv) => srv?.listening).map((srv) => new Promise((resolve) => srv.close(() => resolve())));
+      return Promise.all(closing);
     },
   };
+}
+
+// "iOS 18.2" or "Android 15" from a browser's User-Agent, for the log.
+export function platformOf(ua = '') {
+  const ios = /OS (\d+)[_.](\d+)[_\d]* like Mac OS X/.exec(ua);
+  if (ios) return `, iOS ${ios[1]}.${ios[2]}`;
+  const android = /Android (\d+(?:\.\d+)?)/.exec(ua);
+  return android ? `, Android ${android[1]}` : '';
 }
 
 function isLocalRequest(req) {
@@ -216,6 +286,10 @@ function serveStatic(res, pathname) {
   }
   const file = path.resolve(WEB_DIR, `.${path.posix.normalize(rel)}`);
   if (!file.startsWith(WEB_DIR + path.sep)) return send(res, 404, 'text/plain', 'Not found');
+  sendFile(res, file);
+}
+
+function sendFile(res, file) {
   fs.readFile(file, (err, data) => {
     if (err) return send(res, 404, 'text/plain', 'Not found');
     res.writeHead(200, {

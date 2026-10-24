@@ -129,7 +129,6 @@ export const PROFILES = [
       { id: 'zoomIn', label: 'Zoom in', icon: 'zoom-in', keys: 'cmd+=' },
       { id: 'zoomOut', label: 'Zoom out', icon: 'zoom-out', keys: 'cmd+-' },
     ],
-    strip: ['back', 'prevTab', 'nextTab', 'newTab', 'closeTab', 'reload'],
   },
   {
     id: 'default', kind: 'grid', title: 'Mac',
@@ -148,7 +147,6 @@ export const PROFILES = [
       { id: 'desktopLeft', label: 'Desktop left', icon: 'chevron-left', sys: 'desktopLeft' },
       { id: 'desktopRight', label: 'Desktop right', icon: 'chevron-right', sys: 'desktopRight' },
     ],
-    strip: ['mission', 'spotlight', 'switch', 'copy', 'paste', 'undo'],
   },
 ];
 
@@ -176,14 +174,7 @@ export function publicProfile(p) {
     ...(c.hero ? { hero: true } : {}),
     ...(c.then ? { then: c.then } : {}),
   }));
-  const stripIds = p.strip ?? p.controls.slice(0, 6).map((c) => c.id);
-  return {
-    id: p.id,
-    kind: p.kind,
-    title: p.title,
-    controls,
-    strip: stripIds.map((id) => `${p.id}.${id}`),
-  };
+  return { id: p.id, kind: p.kind, title: p.title, controls };
 }
 
 export function findControl(fullId) {

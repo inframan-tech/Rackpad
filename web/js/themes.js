@@ -1,33 +1,20 @@
-// Themes. Colours for the page live in styles.css; these are the bits JS
-// needs: trail style, the browser chrome colour, and the accent colours sent
-// to the Mac so the cursor beacon and click ripples match the phone.
+// The look: a glass surface (black or silver, like the Magic Trackpad) and a
+// single accent colour. The accent is the only colour in the UI; it's sent to
+// the Mac too, so the cursor glow and click ripples match the phone.
 
-export const THEMES = [
-  {
-    id: 'neon', name: 'Neon', chrome: '#05060f',
-    accent: '#00e5ff', accent2: '#ff3df2',
-    trail: { colors: ['#00e5ff', '#ff3df2'], life: 420, width: 7, glow: 18, style: 'neon' },
-  },
-  {
-    id: 'ipod', name: 'Retro iPod', chrome: '#e9ebee',
-    accent: '#2f6fde', accent2: '#8aa0b0',
-    trail: { colors: ['#2f6fde', '#6f9cf0'], life: 360, width: 5, glow: 0, style: 'ink' },
-  },
-  {
-    id: 'glass', name: 'Glass', chrome: '#1a1033',
-    accent: '#ffffff', accent2: '#ffc2ee',
-    trail: { colors: ['#ffffff', '#c9e6ff'], life: 520, width: 9, glow: 22, style: 'soft' },
-  },
-  {
-    id: 'black', name: 'Pure Black', chrome: '#000000',
-    accent: '#d9d9d9', accent2: '#8c8c8c',
-    trail: { colors: ['#5a5a5a', '#3a3a3a'], life: 260, width: 4, glow: 0, style: 'ink' },
-  },
-  {
-    id: 'haze', name: 'Haze 🌿', chrome: '#050d08',
-    accent: '#6dff9c', accent2: '#c6ff6d',
-    trail: { colors: ['#6dff9c', '#c6ff6d'], life: 1100, width: 14, glow: 26, style: 'smoke' },
-  },
+export const SURFACES = [
+  { id: 'black', name: 'Black', chrome: '#000000', light: false },
+  { id: 'silver', name: 'Silver', chrome: '#dcdce1', light: true },
 ];
 
-export const themeById = (id) => THEMES.find((t) => t.id === id) ?? THEMES[0];
+export const ACCENTS = [
+  { id: 'ice', name: 'Ice', color: '#64d2ff' },
+  { id: 'blue', name: 'Blue', color: '#0a84ff' },
+  { id: 'violet', name: 'Violet', color: '#bf5af2' },
+  { id: 'pink', name: 'Pink', color: '#ff375f' },
+  { id: 'orange', name: 'Orange', color: '#ff9f0a' },
+  { id: 'green', name: 'Green', color: '#30d158' },
+];
+
+export const surfaceById = (id) => SURFACES.find((s) => s.id === id) ?? SURFACES[0];
+export const accentById = (id) => ACCENTS.find((a) => a.id === id) ?? ACCENTS[0];

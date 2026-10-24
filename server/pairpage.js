@@ -13,7 +13,16 @@ const SIM_APPS = [
   ['com.colliderli.iina', 'IINA', 'movie.mkv'],
 ];
 
-export function renderPairPage({ qr, pairing, macName, version, dryRun }) {
+export function renderPairPage({ qr, secureQr = null, pairing, macName, version, dryRun }) {
+  const secure = secureQr
+    ? `<section class="card secure">
+        <h2>Secure link 🔒</h2>
+        <div class="secure-row">
+          <div class="qr small" aria-label="Secure pairing QR code">${secureQr}</div>
+          <p>For the mic and live camera. Scan this once the phone trusts Rackpad's certificate: in Rackpad on the phone, open <b>Settings → Secure connection</b> and follow the three steps. Then add this secure Rackpad to the Home Screen.</p>
+        </div>
+      </section>`
+    : '';
   const sim = dryRun
     ? `<section class="card sim">
         <h2>Dry run</h2>
@@ -29,17 +38,17 @@ export function renderPairPage({ qr, pairing, macName, version, dryRun }) {
 <title>Pair Rackpad</title>
 <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
 <style>
-  :root { --bg:#05060f; --card:#0d1026; --line:rgba(120,140,255,.18); --text:#eef1ff; --muted:#8a90b8; --accent:#00e5ff; --accent2:#ff3df2; --ok:#4dffa6; --warn:#ffcc4d; }
+  :root { --bg:#000; --card:#0f0f11; --line:rgba(255,255,255,.08); --text:#f5f5f7; --muted:#8e8e93; --accent:#64d2ff; --ok:#30d158; --warn:#ffd60a; }
   * { box-sizing: border-box; }
-  body { margin:0; min-height:100vh; background: radial-gradient(120% 80% at 50% 0%, #151a45 0%, var(--bg) 60%); color:var(--text);
+  body { margin:0; min-height:100vh; background: var(--bg); color:var(--text);
     font: 15px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; display:flex; justify-content:center; padding:48px 16px; }
   main { width:100%; max-width:880px; display:grid; grid-template-columns: 360px 1fr; gap:24px; align-items:start; }
   @media (max-width: 760px) { main { grid-template-columns: 1fr; } }
   h1 { grid-column: 1 / -1; margin:0 0 4px; font-size:32px; letter-spacing:-.02em; }
-  h1 span { background: linear-gradient(90deg, var(--accent), var(--accent2)); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  h1 span { color: var(--accent); }
   .sub { grid-column: 1 / -1; margin:-12px 0 8px; color:var(--muted); }
   .card { background:var(--card); border:1px solid var(--line); border-radius:22px; padding:22px; }
-  .qr { background:#fff; border-radius:18px; padding:18px; box-shadow: 0 0 60px rgba(0,229,255,.25); }
+  .qr { background:#fff; border-radius:18px; padding:18px; }
   .qr svg { display:block; width:100%; height:auto; }
   h2 { font-size:13px; text-transform:uppercase; letter-spacing:.12em; color:var(--muted); margin:0 0 10px; }
   ol { margin:0; padding-left:20px; } li { margin:6px 0; }
@@ -52,6 +61,10 @@ export function renderPairPage({ qr, pairing, macName, version, dryRun }) {
   .muted { color:var(--muted); }
   .stack { display:grid; gap:24px; }
   .sim-row { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+  .secure-row { display:flex; gap:18px; align-items:center; }
+  .qr.small { flex:none; width:150px; padding:10px; border-radius:12px; }
+  .secure p { margin:0; color:var(--muted); }
+  .secure b { color:var(--text); }
   .sim button { background:rgba(255,255,255,.06); color:var(--text); border:1px solid var(--line); border-radius:999px; padding:8px 12px; font:inherit; font-size:13px; cursor:pointer; }
   .sim button span { color:var(--muted); }
   .sim button:hover { border-color:var(--accent); }
@@ -70,18 +83,21 @@ export function renderPairPage({ qr, pairing, macName, version, dryRun }) {
         <li>Tap the link. Rackpad opens in Safari.</li>
         <li>Tap <b>Share</b> → <b>Add to Home Screen</b>. From then on the icon connects by itself, on any network where your phone and Mac are together.</li>
       </ol>
+      <p class="muted" style="margin:12px 0 0">Rackpad already on your Home Screen? Open it and tap <b>Scan QR code</b>.</p>
     </section>
     <section class="card status">
       <h2>Status</h2>
       <div class="row"><span class="dot" id="d-helper"></span><span id="s-helper">Checking…</span></div>
       <div class="row"><span class="dot" id="d-phones"></span><span id="s-phones">No phones connected yet</span></div>
       <div class="row"><span class="dot ok"></span><span id="s-app" class="muted"></span></div>
+      <div class="row" id="r-awdl" hidden><span class="dot warn"></span><span>AirDrop &amp; Handoff are using the Wi-Fi radio, which makes the pointer hitch about twice a second. For the smoothest pointer run <code>sudo ifconfig awdl0 down</code> (it comes back on restart).</span></div>
     </section>
     <section class="card">
       <h2>Or type this address</h2>
       <span class="url">${esc(pairing.primary)}</span>
       ${pairing.fallbacks.length ? `<p class="muted" style="margin:10px 0 0">If that doesn't load (some office networks block <code>.local</code> names):</p>${pairing.fallbacks.map((u) => `<span class="url">${esc(u)}</span>`).join('')}` : ''}
     </section>
+    ${secure}
     ${sim}
   </div>
 </main>
@@ -106,6 +122,7 @@ export function renderPairPage({ qr, pairing, macName, version, dryRun }) {
       $('s-phones').textContent = s.phones.length ? s.phones.length + ' connected: ' + s.phones.join(', ') : 'No phones connected yet';
       $('d-phones').className = 'dot ' + (s.phones.length ? 'ok' : '');
       $('s-app').textContent = 'In front: ' + (s.app.name || 'unknown') + ' → "' + s.profile + '" layout';
+      $('r-awdl').hidden = !s.awdl;
     } catch { $('s-helper').textContent = 'Rackpad is not running'; $('d-helper').className = 'dot warn'; }
   }
   poll(); setInterval(poll, 1500);

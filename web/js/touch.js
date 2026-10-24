@@ -3,9 +3,12 @@
 
 const points = (list) => Array.from(list, (t) => ({ id: t.identifier, x: t.clientX, y: t.clientY }));
 
-// `hooks.point(id, x, y)` and `hooks.lift(id)` let the trails follow fingers.
+// When the touch happened, on performance.now()'s clock, rather than when
+// this handler got round to running. The Mac replays movement on this beat.
+const stamp = (e) => (e.timeStamp > 0 && e.timeStamp <= performance.now() + 1 ? e.timeStamp : performance.now());
+
+// `hooks.point(id, x, y)` and `hooks.lift(id)` let the touch glow follow fingers.
 export function bindSurface(el, rec, hooks = {}) {
-  const now = () => performance.now();
   const track = (e) => {
     for (const t of e.changedTouches) hooks.point?.(t.identifier, t.clientX, t.clientY);
   };
@@ -13,17 +16,17 @@ export function bindSurface(el, rec, hooks = {}) {
     e.preventDefault();
     hooks.begin?.();
     track(e);
-    rec.start(points(e.targetTouches), now());
+    rec.start(points(e.targetTouches), stamp(e));
   }, { passive: false });
   el.addEventListener('touchmove', (e) => {
     e.preventDefault();
     track(e);
-    rec.move(points(e.targetTouches), now());
+    rec.move(points(e.targetTouches), stamp(e));
   }, { passive: false });
   el.addEventListener('touchend', (e) => {
     e.preventDefault();
     for (const t of e.changedTouches) hooks.lift?.(t.identifier);
-    rec.end(points(e.targetTouches), now());
+    rec.end(points(e.targetTouches), stamp(e));
   }, { passive: false });
   el.addEventListener('touchcancel', (e) => {
     for (const t of e.changedTouches) hooks.lift?.(t.identifier);
@@ -37,18 +40,18 @@ export function bindSurface(el, rec, hooks = {}) {
     mouseDown = true;
     hooks.begin?.();
     hooks.point?.('m', e.clientX, e.clientY);
-    rec.start([{ id: 'm', x: e.clientX, y: e.clientY }], now());
+    rec.start([{ id: 'm', x: e.clientX, y: e.clientY }], stamp(e));
   });
   window.addEventListener('mousemove', (e) => {
     if (!mouseDown) return;
     hooks.point?.('m', e.clientX, e.clientY);
-    rec.move([{ id: 'm', x: e.clientX, y: e.clientY }], now());
+    rec.move([{ id: 'm', x: e.clientX, y: e.clientY }], stamp(e));
   });
-  window.addEventListener('mouseup', () => {
+  window.addEventListener('mouseup', (e) => {
     if (!mouseDown) return;
     mouseDown = false;
     hooks.lift?.('m');
-    rec.end([], now());
+    rec.end([], stamp(e));
   });
   el.addEventListener('contextmenu', (e) => e.preventDefault());
 }

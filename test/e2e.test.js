@@ -10,6 +10,12 @@ import { createRequire } from 'node:module';
 import { execSync } from 'node:child_process';
 import path from 'node:path';
 import http from 'node:http';
+import https from 'node:https';
+import fs from 'node:fs';
+import os from 'node:os';
+import { X509Certificate } from 'node:crypto';
+import QRCode from 'qrcode';
+import { ensureTls } from '../server/tls.js';
 import { createRackpadServer } from '../server/server.js';
 import { DryRunBackend } from '../server/backend.js';
 
@@ -28,7 +34,7 @@ function loadPlaywright() {
 
 const pw = loadPlaywright();
 const TOKEN = 'e2e-token-abcdefghijkl';
-let backend, server, port, browser, page, cdp;
+let backend, server, port, securePort, browser, page, cdp;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const opsOf = (kind) => backend.ops.filter((o) => o.op === kind);
@@ -60,6 +66,16 @@ async function gesture(frames, stepMs = 16) {
   await touch('touchEnd', []);
 }
 
+// Let a scroll glide from an earlier test die down: a touch during a glide
+// only stops it (like grabbing a scrolling list), it doesn't click.
+async function settle() {
+  let seen = -1;
+  while (seen !== backend.ops.length) {
+    seen = backend.ops.length;
+    await sleep(150);
+  }
+}
+
 async function center(sel) {
   const b = await page.locator(sel).boundingBox();
   return [b.x + b.width / 2, b.y + b.height / 2, b];
@@ -73,21 +89,24 @@ async function show(view) {
 before(async () => {
   if (!pw) return;
   backend = new DryRunBackend();
+  const tls = ensureTls({ hostName: 'test', ips: [], dir: fs.mkdtempSync(path.join(os.tmpdir(), 'rackpad-e2e-tls-')) });
   server = createRackpadServer({
     backend,
     token: TOKEN,
     macName: 'Test Mac',
     version: '0.0.0-test',
     pairing: { primary: `http://test.local:1/?k=${TOKEN}`, fallbacks: [] },
+    tls,
   });
   port = await server.listen(0, '127.0.0.1');
+  securePort = await server.listenSecure(0, '127.0.0.1');
   browser = await pw.chromium.launch();
   const ctx = await browser.newContext({ ...pw.devices['iPhone 14 Pro'] });
   await ctx.addInitScript(() => localStorage.setItem('rackpad.installTipShown', 'true'));
   page = await ctx.newPage();
   cdp = await ctx.newCDPSession(page);
   await page.goto(`http://127.0.0.1:${port}/?k=${TOKEN}`);
-  await page.waitForFunction(() => document.querySelector('#conn').dataset.state === 'open');
+  await page.waitForFunction(() => document.querySelector('#presence').dataset.state === 'open');
 });
 
 after(async () => {
@@ -99,8 +118,10 @@ const skip = !pw && 'Playwright not installed';
 
 test('connects, names the Mac, and pushes settings to the helper', { skip }, async () => {
   assert.equal(await page.textContent('#mac-name'), 'Test Mac');
+  await page.waitForFunction(() => /^\d+ ms$/.test(document.querySelector('#ping-ms').textContent));
+  assert.equal(await page.getAttribute('#ping', 'data-level'), 'ok', 'a local round trip is quick');
   await waitFor(() => opsOf('config').length > 0);
-  assert.equal(opsOf('config').at(-1).color, '#00e5ff');
+  assert.equal(opsOf('config').at(-1).color, '#64d2ff');
 });
 
 test('tap on the trackpad clicks; two taps double-click', { skip }, async () => {
@@ -119,9 +140,8 @@ test('one finger moves the pointer', { skip }, async () => {
   reset();
   const [x, y] = await center('#pad');
   await gesture(Array.from({ length: 10 }, (_, i) => [[x - 60 + i * 12, y]]));
-  await waitFor(() => opsOf('move').length >= 5);
-  const dx = opsOf('move').reduce((s, o) => s + o.dx, 0);
-  assert.ok(dx > 108, `moved ${dx}`);
+  // Movement plays a few ms behind the finger, so wait for all of it.
+  await waitFor(() => opsOf('move').reduce((s, o) => s + o.dx, 0) > 108);
   assert.equal(opsOf('button').length, 0);
 });
 
@@ -145,10 +165,9 @@ test('three-finger swipe up opens Mission Control', { skip }, async () => {
   await waitFor(() => opsOf('missionControl').length === 1);
 });
 
-test('couch mode: hold then release right-clicks', { skip }, async () => {
-  await show('couch');
+test('holding still, then letting go, right-clicks', { skip }, async () => {
   reset();
-  const [x, y] = await center('#couch');
+  const [x, y] = await center('#pad');
   await touch('touchStart', [[x, y]]);
   await sleep(550);
   await touch('touchEnd', []);
@@ -156,7 +175,7 @@ test('couch mode: hold then release right-clicks', { skip }, async () => {
   assert.equal(opsOf('button')[0].b, 'right');
 });
 
-test('couch mode: the strip scrolls', { skip }, async () => {
+test('the edge strip scrolls with one thumb', { skip }, async () => {
   reset();
   const [x, y] = await center('#strip');
   await gesture(Array.from({ length: 8 }, (_, i) => [[x, y - 80 + i * 20]]));
@@ -203,7 +222,7 @@ test('sticky ⌘ turns the next letter into a shortcut', { skip }, async () => {
 });
 
 test('turning the click wheel clockwise turns the volume up', { skip }, async () => {
-  await show('wheel');
+  await show('remote');
   reset();
   const [cx, cy, box] = await center('#wheel');
   const r = box.width * 0.4;
@@ -225,7 +244,7 @@ test('tapping the wheel centre plays/pauses', { skip }, async () => {
 
 test('smart layout follows the front app and its buttons work', { skip }, async () => {
   backend.setApp({ bundleId: 'us.zoom.xos', name: 'zoom.us' });
-  await page.waitForFunction(() => document.querySelector('#tab-app-label').textContent === 'Zoom');
+  await page.waitForFunction(() => document.querySelector('#smart-panel').dataset.profile === 'zoom');
   await show('app');
   reset();
   await page.locator('.hero-btn').click();
@@ -233,9 +252,80 @@ test('smart layout follows the front app and its buttons work', { skip }, async 
   assert.deepEqual(opsOf('key')[0], { op: 'key', code: 0, char: 'a', mods: ['cmd', 'shift'] });
 
   backend.setApp({ bundleId: 'com.apple.Safari', name: 'Safari', title: 'Docs' });
-  await page.waitForFunction(() => document.querySelector('#tab-app-label').textContent === 'Browser');
+  await page.waitForFunction(() => document.querySelector('#smart-panel').dataset.profile === 'browser');
   await page.locator('.tile', { hasText: 'Address bar' }).click();
   await page.waitForFunction(() => document.querySelector('section[data-view="keys"]').classList.contains('active'));
+});
+
+test('sideways, the whole phone is the trackpad', { skip }, async () => {
+  await show('keys');
+  await page.setViewportSize({ width: 852, height: 393 });
+  await page.waitForFunction(() => document.body.classList.contains('magic'));
+  assert.equal(await page.locator('#dock').isVisible(), false);
+  assert.equal(await page.locator('section[data-view="pad"]').isVisible(), true);
+  await settle();
+  reset();
+  const [x, y] = await center('#pad');
+  await gesture([[[x, y]]]);
+  await waitFor(() => opsOf('button').length === 2);
+
+  // The space beside the glass holds the scroll strip…
+  const [sx, sy, strip] = await center('#strip');
+  assert.ok(strip.x + strip.width >= 852 - 1, 'the strip sits at the edge, outside the glass');
+  reset();
+  await gesture(Array.from({ length: 6 }, (_, i) => [[sx, sy - 50 + i * 20]]));
+  await waitFor(() => opsOf('scroll').length >= 3);
+
+  // …and the keyboard key, which swaps the glass for typing and back.
+  await page.locator('#side-key').click();
+  await page.waitForFunction(() => document.querySelector('section[data-view="keys"]').classList.contains('active'));
+  assert.equal(await page.evaluate(() => document.activeElement?.id), 'type-field');
+  reset();
+  await page.keyboard.type('hi');
+  await waitFor(() => opsOf('text').length === 2);
+  await page.locator('#side-key').click();
+  await page.waitForFunction(() => document.querySelector('section[data-view="pad"]').classList.contains('active'));
+
+  await page.setViewportSize({ width: 393, height: 660 });
+  await page.waitForFunction(() => !document.body.classList.contains('magic'));
+  assert.equal(await page.locator('section[data-view="keys"]').isVisible(), true, 'back to where you were');
+});
+
+test('touching the phone keeps the Wi-Fi link warm; idle, it goes quiet', { skip }, async () => {
+  await show('pad');
+  const pings = () => page.evaluate(() => window.rackpad.conn.pingId);
+  await page.evaluate(() => (window.rackpad.conn.lastUse = -Infinity)); // as if untouched for a while
+  let before = await pings();
+  await sleep(400);
+  assert.ok((await pings()) - before <= 1, 'idle: a ping every 2 s at most');
+  const [x, y] = await center('#pad');
+  await settle();
+  await gesture([[[x, y]]]);
+  before = await pings();
+  await sleep(400);
+  const warm = (await pings()) - before;
+  assert.ok(warm >= 12, `in use: a ping every 20 ms (${warm} in 400 ms)`);
+  assert.match(await page.textContent('#ping-ms'), /^\d+ ms$/);
+});
+
+test('a fresh Home Screen app pairs itself from a photo of the QR code', { skip }, async () => {
+  const ctx = await browser.newContext({ ...pw.devices['iPhone 14 Pro'] });
+  const phone = await ctx.newPage();
+  await phone.goto(`http://127.0.0.1:${port}/`); // no token, no storage
+  await phone.waitForSelector('#pairing:not([hidden])');
+
+  // A photo with no code in it.
+  const icon = await (await fetch(`http://127.0.0.1:${port}/icons/icon-192.png`)).arrayBuffer();
+  await phone.setInputFiles('#scan-input', { name: 'IMG_0001.png', mimeType: 'image/png', buffer: Buffer.from(icon) });
+  await phone.waitForFunction(() => /doesn't show a Rackpad code/.test(document.querySelector('#pairing-msg').textContent));
+
+  // A photo of the Mac's QR code.
+  const qr = await QRCode.toBuffer(`http://test.local:${port}/?k=${TOKEN}`, { scale: 8, margin: 4 });
+  await phone.setInputFiles('#scan-input', { name: 'IMG_0002.png', mimeType: 'image/png', buffer: qr });
+  await phone.waitForFunction(() => document.querySelector('#presence').dataset.state === 'open');
+  assert.equal(new URL(phone.url()).searchParams.get('k'), TOKEN);
+  assert.equal(await phone.evaluate(() => JSON.parse(localStorage.getItem('rackpad.token'))), TOKEN);
+  await ctx.close();
 });
 
 test('a wrong pairing code shows the pairing screen', { skip }, async () => {
@@ -244,6 +334,35 @@ test('a wrong pairing code shows the pairing screen', { skip }, async () => {
   await p2.waitForSelector('#pairing:not([hidden])');
   assert.match(await p2.textContent('#pairing-msg'), /no longer valid/);
   await p2.close();
+});
+
+test('the plain page offers secure setup, and waits until the phone trusts the certificate', { skip }, async () => {
+  await page.waitForFunction(() => document.querySelector('#secure-state').textContent === 'Set up');
+  await page.evaluate(() => document.querySelector('#open-secure').click());
+  await page.waitForSelector('#secure:not([hidden])');
+  // This test browser doesn't trust Rackpad's authority, so the secure page can't answer yet.
+  await page.waitForFunction(() => document.querySelector('#secure-open').textContent === 'Check again');
+  assert.equal(await page.getAttribute('#secure-download', 'href'), '/rackpad.crt');
+  await page.evaluate(() => document.querySelector('#secure-done').click());
+});
+
+test('over HTTPS the same app connects securely and works', { skip }, async () => {
+  const ctx = await browser.newContext({ ...pw.devices['iPhone 14 Pro'], ignoreHTTPSErrors: true }); // as if the phone trusts it
+  await ctx.addInitScript(() => localStorage.setItem('rackpad.installTipShown', 'true'));
+  const phone = await ctx.newPage();
+  const phoneCdp = await ctx.newCDPSession(phone);
+  await phone.goto(`https://127.0.0.1:${securePort}/?k=${TOKEN}`);
+  await phone.waitForFunction(() => document.querySelector('#presence').dataset.state === 'open');
+  assert.equal(await phone.textContent('#secure-state'), 'On');
+  assert.equal(await phone.evaluate(() => window.isSecureContext && typeof navigator.mediaDevices?.getUserMedia), 'function', 'the mic and camera are offered now');
+  await settle();
+  reset();
+  const b = await phone.locator('#pad').boundingBox();
+  const at = [{ x: b.x + b.width / 2, y: b.y + b.height / 2, id: 0 }];
+  await phoneCdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: at });
+  await phoneCdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  await waitFor(() => opsOf('button').length === 2);
+  await ctx.close();
 });
 
 function get(pathname, headers = {}) {
@@ -266,5 +385,32 @@ test('server: static files are confined, pairing page is Mac-only', { skip }, as
   assert.match(pair.body, /<svg/);
   const manifest = JSON.parse((await get(`/manifest.webmanifest?k=${TOKEN}`)).body);
   assert.equal(manifest.start_url, `/?k=${TOKEN}`);
-  assert.equal(JSON.parse((await get('/manifest.webmanifest?k=nope')).body).start_url, '/');
+  assert.equal(manifest.orientation, 'any');
+  // Without a token, start_url defaults to the address of the page that linked the manifest.
+  assert.equal(JSON.parse((await get('/manifest.webmanifest?k=nope')).body).start_url, undefined);
+  // The page links the manifest with the token from the start, so the Home Screen icon opens paired.
+  assert.match((await get(`/?k=${TOKEN}`)).body, new RegExp(`href="/manifest\\.webmanifest\\?k=${TOKEN}"`));
+  assert.match((await get('/?k=nope')).body, /href="\/manifest\.webmanifest"/);
+  assert.equal((await get('/vendor/jsQR.js')).status, 200);
+  assert.equal((await get('/vendor/__proto__')).status, 404);
+
+  // The authority the phone installs, served as a certificate (DER).
+  const ca = await new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port, path: '/rackpad.crt' }, (res) => {
+      const parts = [];
+      res.on('data', (c) => parts.push(c));
+      res.on('end', () => resolve({ type: res.headers['content-type'], body: Buffer.concat(parts) }));
+    }).on('error', reject);
+  });
+  assert.equal(ca.type, 'application/x-x509-ca-cert');
+  assert.match(new X509Certificate(ca.body).subject, /Rackpad Local CA/);
+  assert.equal(JSON.parse((await get('/secure-check')).body).secure, false);
+  const secureCheck = await new Promise((resolve, reject) => {
+    https.get({ host: '127.0.0.1', port: securePort, path: '/secure-check', rejectUnauthorized: false }, (res) => {
+      let body = '';
+      res.on('data', (c) => (body += c));
+      res.on('end', () => resolve(JSON.parse(body)));
+    }).on('error', reject);
+  });
+  assert.equal(secureCheck.secure, true);
 });

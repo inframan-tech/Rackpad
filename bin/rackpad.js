@@ -5,7 +5,8 @@ import { readFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import QRCode from 'qrcode';
 import { loadConfig, saveConfig, newToken, CONFIG_DIR } from '../server/config.js';
-import { macNames, pairingUrls } from '../server/net.js';
+import { macNames, pairingUrls, lanAddresses, awdlActive, AWDL_TIP } from '../server/net.js';
+import { ensureTls, wantedNames } from '../server/tls.js';
 import { createRackpadServer } from '../server/server.js';
 import { DryRunBackend, NativeBackend, ensureHelperBuilt } from '../server/backend.js';
 
@@ -20,6 +21,8 @@ Usage:
 
 Options:
   --port <n>       Port to listen on (default 8421, or $RACKPAD_PORT)
+  --https-port <n> Port for HTTPS (default 8422); needed for the mic and live camera
+  --no-https       Serve plain HTTP only
   --host <name>    Hostname or IP to put in the QR code (default: <Mac>.local)
   --dry-run        Don't control the Mac; log what would happen instead
   --pair           Open the pairing page in your browser
@@ -29,7 +32,7 @@ Options:
 `;
 
 function parseArgs(argv) {
-  const opts = { cmd: 'start', port: Number(process.env.RACKPAD_PORT) || 8421, host: null, dryRun: false, pair: false, open: true, verbose: false };
+  const opts = { cmd: 'start', port: Number(process.env.RACKPAD_PORT) || 8421, httpsPort: 8422, https: true, host: null, dryRun: false, pair: false, open: true, verbose: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const value = () => {
@@ -38,6 +41,8 @@ function parseArgs(argv) {
       return v;
     };
     if (a === '--port') opts.port = Number(value());
+    else if (a === '--https-port') opts.httpsPort = Number(value());
+    else if (a === '--no-https') opts.https = false;
     else if (a === '--host') opts.host = value();
     else if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--pair') opts.pair = true;
@@ -47,7 +52,9 @@ function parseArgs(argv) {
     else if (!a.startsWith('-') && ['start', 'build-helper', 'reset-token', 'help'].includes(a)) opts.cmd = a;
     else fail(`Unknown option: ${a}\n\n${HELP}`);
   }
-  if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) fail('--port must be a number between 1 and 65535');
+  for (const [flag, port] of [['--port', opts.port], ['--https-port', opts.httpsPort]]) {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) fail(`${flag} must be a number between 1 and 65535`);
+  }
   return opts;
 }
 
@@ -66,22 +73,48 @@ async function start(opts) {
     opts.dryRun = true;
   }
 
-  const backend = opts.dryRun ? new DryRunBackend({ log, verbose: opts.verbose }) : new NativeBackend({ log });
+  const backend = opts.dryRun ? new DryRunBackend({ log, verbose: opts.verbose }) : new NativeBackend({ log, verbose: opts.verbose });
   backend.on('status', (s) => {
     if (s.error) log(`⚠️  ${s.error}`);
     else if (s.ready && !s.trusted) log('⚠️  Waiting for Accessibility permission: System Settings → Privacy & Security → Accessibility');
     else if (s.ready && s.trusted) log('✅ Ready to control this Mac');
   });
 
-  const { computerName } = macNames();
-  const pairing = pairingUrls({ port: opts.port, token: cfg.token, host: opts.host });
-  const app = createRackpadServer({ backend, token: cfg.token, macName: computerName, version, pairing, log });
+  const { computerName, localHostName } = macNames();
+  // HTTPS with Rackpad's own local certificate (see server/tls.js).
+  let tls = null;
+  if (opts.https) {
+    try {
+      tls = ensureTls({ hostName: localHostName, ips: lanAddresses(), log });
+    } catch (err) {
+      log(`⚠️  HTTPS is off: could not make the certificate (${err.message.split('\n')[0]})`);
+    }
+  }
+  const pairing = pairingUrls({ port: opts.port, token: cfg.token, host: opts.host, securePort: tls ? opts.httpsPort : null });
+  const app = createRackpadServer({ backend, token: cfg.token, macName: computerName, version, pairing, tls, log });
 
-  try {
-    await app.listen(opts.port);
-  } catch (err) {
-    if (err.code === 'EADDRINUSE') fail(`Port ${opts.port} is busy. Is Rackpad already running? Try --port <another>.`);
-    throw err;
+  const listen = async (start, port, flag) => {
+    try {
+      await start(port);
+    } catch (err) {
+      if (err.code === 'EADDRINUSE') fail(`Port ${port} is busy. Is Rackpad already running? Try ${flag} <another>.`);
+      throw err;
+    }
+  };
+  await listen((p) => app.listen(p), opts.port, '--port');
+  if (tls) {
+    await listen((p) => app.listenSecure(p), opts.httpsPort, '--https-port');
+    // Join a new network and the certificate is made again for the new address.
+    setInterval(() => {
+      const names = wantedNames(localHostName, lanAddresses());
+      if (names.join() === tls.names.join()) return;
+      try {
+        tls = ensureTls({ hostName: localHostName, ips: lanAddresses(), log });
+        app.setTls(tls);
+      } catch (err) {
+        log(`⚠️  Could not renew the HTTPS certificate: ${err.message.split('\n')[0]}`);
+      }
+    }, 30000).unref();
   }
   backend.start();
 
@@ -94,8 +127,9 @@ ${qr.replace(/^/gm, '  ')}
   Scan with your phone's camera, or open:
     ${pairing.primary}
 ${pairing.fallbacks.length ? `  If that doesn't load:\n${pairing.fallbacks.map((u) => `    ${u}`).join('\n')}\n` : ''}
-  Pairing page: http://localhost:${opts.port}/pair
+${pairing.secure ? `  Secure (once the phone trusts Rackpad's certificate):\n    ${pairing.secure}\n\n` : ''}  Pairing page: http://localhost:${opts.port}/pair
 `);
+  if (onMac && !opts.dryRun && awdlActive()) log(`⚠️  ${AWDL_TIP}`);
 
   if (onMac && opts.open && (opts.pair || cfg.firstRun)) {
     execFile('open', [`http://localhost:${opts.port}/pair`], () => {});

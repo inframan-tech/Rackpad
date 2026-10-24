@@ -92,6 +92,7 @@ final class Input {
     let source = CGEventSource(stateID: .hidSystemState)
     let layout = KeyboardLayout()
     private var pos = CGEvent(source: nil)?.location ?? .zero
+    private var deltaCarry = CGPoint.zero // fractions of a pixel not yet reported as a delta
     private var lastPost: TimeInterval = 0
     private var leftDown = false, rightDown = false, otherDown = false
     private var displays: [CGRect] = []
@@ -136,8 +137,16 @@ final class Input {
         else if otherDown { type = .otherMouseDragged; button = .center }
         else { type = .mouseMoved; button = .left }
         guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: button) else { return }
-        e.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx.rounded()))
-        e.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy.rounded()))
+        // Movement comes in small fractional steps; apps that read whole-pixel
+        // deltas (games, remote desktops) get them with nothing lost.
+        deltaCarry.x += dx
+        deltaCarry.y += dy
+        let ix = deltaCarry.x.rounded(.towardZero)
+        let iy = deltaCarry.y.rounded(.towardZero)
+        deltaCarry.x -= ix
+        deltaCarry.y -= iy
+        e.setIntegerValueField(.mouseEventDeltaX, value: Int64(ix))
+        e.setIntegerValueField(.mouseEventDeltaY, value: Int64(iy))
         e.post(tap: .cghidEventTap)
         pos = p
         lastPost = now()
@@ -282,6 +291,7 @@ final class Beacon {
         return w
     }()
     private let glow = CAGradientLayer()
+    private let rim = CAShapeLayer()
     private let ring = CAShapeLayer()
     private var follow: Timer?
     private var lastActivity: TimeInterval = 0
@@ -303,7 +313,14 @@ final class Beacon {
         ring.shadowOffset = .zero
         ring.shadowRadius = 8
         ring.shadowOpacity = 1
+        // A dark rim under the ring keeps it visible on white windows too.
+        rim.frame = bounds
+        rim.path = ring.path
+        rim.fillColor = nil
+        rim.lineWidth = 6
+        rim.strokeColor = NSColor.black.withAlphaComponent(0.3).cgColor
         root.addSublayer(glow)
+        root.addSublayer(rim)
         root.addSublayer(ring)
         root.opacity = 0
         applyColor()
@@ -346,6 +363,7 @@ final class Beacon {
             grow.duration = 0.5
             grow.timingFunction = CAMediaTimingFunction(name: .easeOut)
             ring.add(grow, forKey: "pulse")
+            rim.add(grow, forKey: "pulse")
         }
         let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.frame() }
         RunLoop.main.add(timer, forMode: .common)
@@ -399,9 +417,18 @@ final class Ripples {
         guard let root = w.contentView?.layer else { return }
         root.sublayers?.forEach { $0.removeFromSuperlayer() }
         let c = secondary ? color2 : color
+        let path = CGPath(ellipseIn: root.bounds.insetBy(dx: 10, dy: 10), transform: nil)
+        let rim = CAShapeLayer()
+        rim.frame = root.bounds
+        rim.path = path
+        rim.fillColor = nil
+        rim.strokeColor = NSColor.black.withAlphaComponent(0.25).cgColor
+        rim.lineWidth = 6
+        rim.opacity = 0
+        root.addSublayer(rim)
         let ring = CAShapeLayer()
         ring.frame = root.bounds
-        ring.path = CGPath(ellipseIn: root.bounds.insetBy(dx: 10, dy: 10), transform: nil)
+        ring.path = path
         ring.fillColor = c.withAlphaComponent(0.14).cgColor
         ring.strokeColor = c.cgColor
         ring.lineWidth = 3
@@ -429,6 +456,7 @@ final class Ripples {
         group.duration = 0.5
         group.timingFunction = CAMediaTimingFunction(name: .easeOut)
         ring.add(group, forKey: "ripple")
+        rim.add(group, forKey: "ripple")
         CATransaction.commit()
     }
 }

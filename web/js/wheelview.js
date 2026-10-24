@@ -12,7 +12,7 @@ export class WheelView {
     this.el = root.querySelector('#wheel');
     this.dot = root.querySelector('#wheel-dot');
     this.center = root.querySelector('#wheel-center');
-    this.lcd = root.querySelector('.lcd');
+    this.readout = root.querySelector('#readout');
     this.pct = root.querySelector('#vol-pct');
     this.fill = root.querySelector('#vol-fill');
     this.tracker = new WheelTracker();
@@ -107,8 +107,8 @@ export class WheelView {
   // From the Mac (the truth), or predicted locally while turning (`guess`).
   showVolume({ level, muted }, guess = false) {
     if (!guess) this.level = level;
-    this.pct.textContent = muted ? 'Muted' : `${Math.round(level)}%`;
+    this.pct.textContent = muted ? 'Muted' : String(Math.round(level));
     this.fill.style.width = `${muted ? 0 : level}%`;
-    this.lcd.classList.toggle('muted', !!muted);
+    this.readout.classList.toggle('muted', !!muted);
   }
 }

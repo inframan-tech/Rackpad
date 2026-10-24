@@ -1,22 +1,33 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <defs>
-    <radialGradient id="bg" cx="50%" cy="0%" r="110%">
-      <stop offset="0" stop-color="#1f2766"/>
-      <stop offset="0.65" stop-color="#070920"/>
-      <stop offset="1" stop-color="#05060f"/>
-    </radialGradient>
-    <linearGradient id="trail" x1="0" y1="1" x2="1" y2="0">
-      <stop offset="0" stop-color="#ff3df2" stop-opacity="0"/>
-      <stop offset="0.45" stop-color="#ff3df2"/>
-      <stop offset="1" stop-color="#00e5ff"/>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#141416"/>
+      <stop offset="1" stop-color="#000000"/>
     </linearGradient>
-    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
-      <feGaussianBlur stdDeviation="9" result="b"/>
-      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d1d20"/>
+      <stop offset="1" stop-color="#0c0c0e"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.1"/>
+      <stop offset="0.4" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="light">
+      <stop offset="0" stop-color="#64d2ff" stop-opacity="0.55"/>
+      <stop offset="0.35" stop-color="#64d2ff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#64d2ff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="tail" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#64d2ff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#64d2ff" stop-opacity="0.7"/>
+    </linearGradient>
   </defs>
-  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
-  <rect x="96" y="120" width="320" height="272" rx="44" fill="none" stroke="#00e5ff" stroke-opacity="0.85" stroke-width="14" filter="url(#glow)"/>
-  <path d="M142 336 C 190 330, 214 250, 270 236 S 336 214, 352 176" fill="none" stroke="url(#trail)" stroke-width="18" stroke-linecap="round" filter="url(#glow)"/>
-  <circle cx="352" cy="176" r="20" fill="#ffffff" filter="url(#glow)"/>
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <rect x="96" y="138" width="320" height="236" rx="42" fill="url(#glass)"/>
+  <rect x="96" y="138" width="320" height="236" rx="42" fill="url(#sheen)"/>
+  <rect x="97.5" y="139.5" width="317" height="233" rx="40.5" fill="none" stroke="#ffffff" stroke-opacity="0.13" stroke-width="3"/>
+  <path d="M190 320 Q 244 304 290 252" fill="none" stroke="url(#tail)" stroke-width="13" stroke-linecap="round"/>
+  <circle cx="290" cy="252" r="88" fill="url(#light)"/>
+  <circle cx="290" cy="252" r="16" fill="#64d2ff"/>
+  <circle cx="290" cy="252" r="7" fill="#ffffff"/>
 </svg>

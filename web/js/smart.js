@@ -1,5 +1,5 @@
-// Smart layout: the strip above the tabs and the App tab redraw themselves
-// for whatever app is in front on the Mac.
+// Smart layout: the App view redraws itself for whatever app is in front on
+// the Mac.
 
 import { icon } from './icons.js';
 import { onTap } from './touch.js';
@@ -14,10 +14,8 @@ const KIND_TEXT = {
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
 export class Smart {
-  constructor({ strip, panel, tabLabel, send, feel, onThen }) {
-    this.strip = strip;
+  constructor({ panel, send, feel, onThen }) {
     this.panel = panel;
-    this.tabLabel = tabLabel;
     this.send = send;
     this.feel = feel;
     this.onThen = onThen;
@@ -47,14 +45,7 @@ export class Smart {
   render() {
     const { profile, app } = this.ctx;
     const byId = new Map(profile.controls.map((c) => [c.id, c]));
-    this.tabLabel.textContent = profile.kind === 'grid' && profile.id === 'default' ? 'App' : profile.title;
-
-    this.strip.innerHTML = profile.strip
-      .map((id) => byId.get(id))
-      .filter(Boolean)
-      .map((c) => `<button class="chip${c.hero ? ' hero' : ''}" data-id="${esc(c.id)}">${icon(c.icon)}<span>${esc(c.label)}</span></button>`)
-      .join('');
-    this.bind(this.strip, byId);
+    this.panel.dataset.profile = profile.id;
 
     const title = profile.id === 'default' ? app.name || 'Mac' : profile.id === 'browser' ? app.name || profile.title : profile.title;
     const head = `<div class="sp-head">${app.icon ? `<img src="${esc(app.icon)}" alt="">` : ''}<div><div class="sp-app">${esc(title)}</div><div class="sp-kind">${KIND_TEXT[profile.kind] ?? ''}</div></div></div>`;

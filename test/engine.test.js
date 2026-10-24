@@ -1,35 +1,44 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Session, Momentum, pointerGain } from '../server/engine.js';
+import { Session, Momentum, Playout, pointerGain } from '../server/engine.js';
 import { parseCombo, resolveKey } from '../server/keys.js';
 import { profileFor, publicProfile, findControl, PROFILES } from '../server/layouts.js';
 import { parseVolumeSettings } from '../server/backend.js';
+import { isAwdlActive } from '../server/net.js';
 
 function session() {
   let t = 1000;
   const ops = [];
-  const timers = [];
+  const timers = new Map();
+  let nextTimer = 1;
   const s = new Session({
     backend: { send: (op) => ops.push(op), volume: async () => ({ level: 40, muted: false }) },
     now: () => t,
-    setInterval: (fn) => (timers.push(fn), timers.length),
-    clearInterval: () => timers.splice(0),
+    setInterval: (fn) => (timers.set(nextTimer, fn), nextTimer++),
+    clearInterval: (id) => timers.delete(id),
   });
+  const tick = (ms) => {
+    t += ms;
+    for (const fn of [...timers.values()]) fn();
+  };
   return {
     s,
     ops,
+    timers,
+    now: () => t,
     advance(ms) {
       t += ms;
     },
-    runMomentum(ms = 3000) {
-      for (let i = 0; i < ms / 8 && timers.length; i++) {
-        t += 8;
-        timers[0]();
-      }
+    run(ms) {
+      for (let i = 0; i < ms / 4; i++) tick(4);
     },
-    timers,
+    runMomentum(ms = 3000) {
+      for (let i = 0; i < ms / 8 && timers.size; i++) tick(8);
+    },
   };
 }
+
+const movedX = (ops) => ops.filter((o) => o.op === 'move').reduce((sum, o) => sum + o.dx, 0);
 
 test('pointer gain is gentle when slow, strong when fast, and monotonic', () => {
   assert.ok(pointerGain(0.02) < 1.3);
@@ -91,12 +100,12 @@ test('fractional scroll deltas are carried, not lost', () => {
 test('momentum glides after a flick, slows down and stops', () => {
   const h = session();
   h.s.handle({ t: 'scrollEnd', vx: 0, vy: 2 });
-  assert.equal(h.timers.length, 1);
+  assert.equal(h.timers.size, 1);
   h.runMomentum();
   const deltas = h.ops.map((o) => o.dy);
   assert.ok(deltas.length > 20);
   assert.ok(deltas[0] >= deltas.at(-1));
-  assert.equal(h.timers.length, 0, 'timer cleared when the glide ends');
+  assert.equal(h.timers.size, 0, 'timer cleared when the glide ends');
   const total = deltas.reduce((a, b) => a + b, 0);
   assert.ok(total > 1000 && total < 2000, `glide distance ${total}`);
 });
@@ -106,7 +115,7 @@ test('touching the phone stops the glide and swallows the stopping tap', () => {
   h.s.handle({ t: 'scrollEnd', vx: 0, vy: 3 });
   h.runMomentum(80);
   h.s.handle({ t: 'touch' });
-  assert.equal(h.timers.length, 0);
+  assert.equal(h.timers.size, 0);
   h.s.handle({ t: 'click', b: 'left' });
   assert.ok(!h.ops.some((o) => o.op === 'button'));
   h.advance(400);
@@ -123,6 +132,67 @@ test('momentum integrates exactly regardless of frame rate', () => {
   for (let t = 4; t <= 400; t += 4) da += a.step(t)?.dy ?? 0;
   for (let t = 16; t <= 400; t += 16) db += b.step(t)?.dy ?? 0;
   assert.ok(Math.abs(da - db) < 0.5, `${da} vs ${db}`);
+});
+
+// ── Playback: smooth movement from uneven Wi-Fi ───────────────────────────
+
+// The finger moves 10 px every 16 ms, but Wi-Fi hands the messages over in
+// clumps of three: the shape of the jitter in a real log. Returns how far the
+// pointer moved in each 4 ms slice of time.
+function playClumps(h, { frames = 90, clump = 3, stamped = true } = {}) {
+  const arrivals = [];
+  for (let i = 0; i < frames; i++) {
+    const last = Math.floor(i / clump) * clump + clump - 1;
+    const msg = { t: 'move', dx: 10, dy: 0, dt: 16 };
+    if (stamped) msg.ts = 5000 + i * 16; // the phone's clock
+    arrivals.push({ at: 1000 + last * 16 + 6, msg });
+  }
+  const slices = [];
+  for (let guard = 0; (arrivals.length || h.timers.size) && guard < 2000; guard++) {
+    const before = h.ops.length;
+    while (arrivals.length && arrivals[0].at <= h.now()) h.s.handle(arrivals.shift().msg);
+    h.run(4);
+    slices.push(movedX(h.ops.slice(before)));
+  }
+  return slices;
+}
+
+test('movement plays back at the pace the finger made it, not in Wi-Fi clumps', () => {
+  const step = 10 * pointerGain(10 / 16); // pointer travel per phone frame
+  const smooth = playClumps(session());
+  assert.ok(Math.abs(smooth.reduce((a, b) => a + b, 0) - 90 * step) < 0.05, 'every pixel arrives');
+  // Once it has learned the network (a few hundred ms), every slice moves the same amount.
+  const steady = smooth.slice(80, -30);
+  for (const d of steady) assert.ok(Math.abs(d - step / 4) < step / 4 * 0.25, `slice moved ${d}, expected ~${step / 4}`);
+
+  // Played as they arrive, the same stroke stalls and jumps.
+  const raw = playClumps(session(), { stamped: false }).slice(80, -30);
+  assert.ok(raw.filter((d) => d === 0).length > raw.length / 2, 'mostly stalled');
+  assert.ok(Math.max(...raw) > 2.5 * step, 'then jumps');
+});
+
+test('a click waits for queued movement, so it lands where the pointer was headed', () => {
+  const h = session();
+  for (let i = 0; i < 5; i++) h.s.handle({ t: 'move', dx: 10, dy: 0, dt: 16, ts: 5000 + i * 16 });
+  const playedSoFar = movedX(h.ops);
+  h.s.handle({ t: 'click', b: 'left' });
+  const click = h.ops.findIndex((o) => o.op === 'button');
+  assert.ok(playedSoFar < movedX(h.ops.slice(0, click)), 'some movement was still queued');
+  assert.ok(Math.abs(movedX(h.ops.slice(0, click)) - 5 * 10 * pointerGain(10 / 16)) < 0.05, 'all of it played before the click');
+  assert.equal(h.timers.size, 0, 'nothing left playing');
+});
+
+test('playout learns the network floor and wobble, and lets stragglers through', () => {
+  const p = new Playout();
+  for (let i = 0; i < 60; i++) {
+    const ts = i * 16;
+    p.when(ts, ts + 105 + (i % 3 === 0 ? 4 : 0)); // 105 ms clock offset + trip, 4 ms wobble
+  }
+  assert.equal(p.buffer, 5, 'plays just behind the usual wobble');
+  const ts = 60 * 16;
+  assert.ok(p.when(ts, ts + 135) < ts + 135, 'a straggler is already due: it plays on arrival');
+  // After a pause (the phone may have slept), it starts learning afresh.
+  assert.equal(p.when(50000, 52000), 52000 + 11);
 });
 
 test('pinch steps become Cmd+= / Cmd+-', () => {
@@ -244,7 +314,6 @@ test('public profiles are namespaced and resolvable', () => {
   for (const p of PROFILES) {
     const pub = publicProfile(p);
     for (const c of pub.controls) assert.ok(findControl(c.id), c.id);
-    for (const id of pub.strip) assert.ok(pub.controls.some((c) => c.id === id), id);
     assert.ok(pub.controls.every((c) => !('keys' in c) && !('media' in c) && !('sys' in c)), 'what a control does stays on the Mac');
   }
 });
@@ -253,4 +322,10 @@ test('parses osascript volume output', () => {
   assert.deepEqual(parseVolumeSettings('output volume:44, input volume:75, alert volume:100, output muted:false'), { level: 44, muted: false });
   assert.deepEqual(parseVolumeSettings('output volume:0, input volume:75, alert volume:100, output muted:true'), { level: 0, muted: true });
   assert.equal(parseVolumeSettings('output volume:missing value, output muted:missing value'), null);
+});
+
+test("spots the AirDrop radio that makes Wi-Fi hitch", () => {
+  assert.equal(isAwdlActive('awdl0: flags=8863<UP,BROADCAST,SMART,RUNNING> mtu 1500\n\tstatus: active\n'), true);
+  assert.equal(isAwdlActive('awdl0: flags=8822<BROADCAST,SMART,SIMPLEX,MULTICAST> mtu 1500\n\tstatus: inactive\n'), false);
+  assert.equal(isAwdlActive(''), false);
 });

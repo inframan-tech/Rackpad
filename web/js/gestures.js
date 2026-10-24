@@ -45,20 +45,32 @@ export const TRACKPAD = {
   tapSlop: 10, // px a tap may wander
   moveSlop: 3, // px before one finger starts moving the pointer
   dragGapMs: 300, // tap, then touch again this soon and move → drag
+  holdMs: 480, // press this long without moving: let go to right-click, or move to drag
+  holdSlop: 8, // px a finger may drift and still count as holding still
   pinchStart: 0.12, // relative spread change that makes two fingers a pinch
   pinchStep: 1.22, // spread ratio per zoom step
   scrollStart: 6, // px two fingers travel before scrolling
   swipeDist: 55, // px three fingers travel to trigger a swipe
 };
 
-// The main trackpad: one finger moves, tap clicks, two fingers scroll or
-// pinch, two-finger tap right-clicks, three-finger swipes switch spaces.
+// The trackpad: one finger moves, tap clicks, two fingers scroll or pinch,
+// two-finger tap right-clicks, three-finger swipes switch spaces. For one
+// thumb: press and hold, then let go to right-click, or move to drag.
 export class TrackpadRecognizer {
-  constructor(emit, { feel = () => {}, opts = {} } = {}) {
+  constructor(emit, {
+    feel = () => {},
+    opts = {},
+    // Wrapped: browsers throw "Illegal invocation" if setTimeout is called as a method.
+    setTimer = (fn, ms) => setTimeout(fn, ms),
+    clearTimer = (id) => clearTimeout(id),
+  } = {}) {
     this.emit = emit;
     this.feel = feel;
     this.o = { ...TRACKPAD, ...opts };
+    this.setTimer = setTimer;
+    this.clearTimer = clearTimer;
     this.g = null;
+    this.holdTimer = null;
     this.lastTapEnd = -Infinity;
     this.vel = new Velocity();
   }
@@ -73,10 +85,11 @@ export class TrackpadRecognizer {
         last: new Map(),
         lastT: t,
         moved: 0,
-        mode: null, // move | drag | scroll | pinch | swipe | done
+        mode: null, // move | held | drag | scroll | pinch | swipe | done
         active: false, // something other than a tap already happened
         dragCandidate: t - this.lastTapEnd < this.o.dragGapMs,
       };
+      if (touches.length === 1) this.holdTimer = this.setTimer(() => this.hold(), this.o.holdMs);
     }
     const g = this.g;
     for (const p of touches) {
@@ -85,8 +98,26 @@ export class TrackpadRecognizer {
     }
     g.maxCount = Math.max(g.maxCount, touches.length);
     this.resetBaseline(touches);
-    // A second finger turns pointer movement into a two-finger gesture.
-    if (touches.length >= 2 && g.mode === 'move') g.mode = null;
+    // A second finger turns pointer movement (or a hold) into a two-finger gesture.
+    if (touches.length >= 2) {
+      this.cancelHold();
+      if (g.mode === 'move' || g.mode === 'held') g.mode = null;
+    }
+  }
+
+  // One finger stayed put long enough: it's holding, not about to tap.
+  hold() {
+    this.holdTimer = null;
+    const g = this.g;
+    if (!g || g.maxCount !== 1 || (g.mode !== null && g.mode !== 'move') || g.moved >= this.o.holdSlop) return;
+    g.mode = 'held';
+    g.holdAt = g.last.values().next().value;
+    this.feel('grab');
+  }
+
+  cancelHold() {
+    if (this.holdTimer !== null) this.clearTimer(this.holdTimer);
+    this.holdTimer = null;
   }
 
   resetBaseline(touches) {
@@ -107,18 +138,29 @@ export class TrackpadRecognizer {
       const s = g.start.get(p.id);
       if (s) g.moved = Math.max(g.moved, dist(p, s));
     }
+    if (g.moved >= this.o.holdSlop) this.cancelHold();
     const dt = Math.max(t - g.lastT, 1);
     g.lastT = t;
 
-    if (touches.length === 1) this.moveOne(touches[0], dt);
+    if (touches.length === 1) this.moveOne(touches[0], t, dt);
     else if (touches.length === 2) this.moveTwo(touches, t, dt);
     else this.moveMany(touches);
 
     for (const p of touches) g.last.set(p.id, { x: p.x, y: p.y });
   }
 
-  moveOne(p, dt) {
+  // Moves and scrolls carry `ts`, when the finger was there (see touch.js).
+  moveOne(p, t, dt) {
     const g = this.g;
+    if (g.mode === 'held') {
+      // Moving on from a hold drags. Small drift while holding is ignored.
+      if (dist(p, g.holdAt) < this.o.holdSlop) return;
+      g.mode = 'drag';
+      g.active = true;
+      this.emit({ t: 'down', b: 'left' });
+      this.emit({ t: 'move', dx: p.x - g.holdAt.x, dy: p.y - g.holdAt.y, dt, ts: t });
+      return;
+    }
     // After a two-finger gesture the leftover finger doesn't drive the pointer.
     if (g.mode && g.mode !== 'move' && g.mode !== 'drag') return;
     const last = g.last.get(p.id) ?? p;
@@ -132,10 +174,10 @@ export class TrackpadRecognizer {
         this.feel('grab');
       }
       // Include the slop so no movement is lost.
-      this.emit({ t: 'move', dx: p.x - s.x, dy: p.y - s.y, dt });
+      this.emit({ t: 'move', dx: p.x - s.x, dy: p.y - s.y, dt, ts: t });
       return;
     }
-    this.emit({ t: 'move', dx: p.x - last.x, dy: p.y - last.y, dt });
+    this.emit({ t: 'move', dx: p.x - last.x, dy: p.y - last.y, dt, ts: t });
   }
 
   moveTwo(ts, t, dt) {
@@ -162,7 +204,7 @@ export class TrackpadRecognizer {
       const dy = c.y - g.cLast.y;
       g.cLast = c;
       if (dx || dy) {
-        this.emit({ t: 'scroll', dx, dy });
+        this.emit({ t: 'scroll', dx, dy, dt, ts: t });
         this.vel.add(t, dx, dy, dt);
       }
     } else if (g.mode === 'pinch') {
@@ -213,9 +255,16 @@ export class TrackpadRecognizer {
       this.resetBaseline(touches);
       return;
     }
+    this.cancelHold();
     this.g = null;
     if (g.mode === 'drag') {
       this.emit({ t: 'up', b: 'left' });
+      return;
+    }
+    if (g.mode === 'held') {
+      this.emit({ t: 'click', b: 'right' });
+      this.feel('tap2');
+      this.lastTapEnd = -Infinity;
       return;
     }
     const isTap = !g.active && g.moved < this.o.tapSlop && t - g.t0 < this.o.tapMs;
@@ -227,102 +276,15 @@ export class TrackpadRecognizer {
   }
 
   cancel() {
+    this.cancelHold();
     if (this.g?.mode === 'drag') this.emit({ t: 'up', b: 'left' });
     if (this.g?.mode === 'scroll') this.emit({ t: 'scrollEnd', vx: 0, vy: 0 });
     this.g = null;
   }
 }
 
-export const COUCH = {
-  holdMs: 430, // press this long to "grab"
-  slop: 10,
-  tapMs: 300,
-};
-
-// One-thumb mode. Tap clicks; press and hold, then move, drags; press and
-// hold, then let go, right-clicks. Extra fingers are ignored.
-export class CouchRecognizer {
-  constructor(emit, {
-    feel = () => {},
-    opts = {},
-    // Wrapped: browsers throw "Illegal invocation" if setTimeout is called as a method.
-    setTimer = (fn, ms) => setTimeout(fn, ms),
-    clearTimer = (id) => clearTimeout(id),
-  } = {}) {
-    this.emit = emit;
-    this.feel = feel;
-    this.o = { ...COUCH, ...opts };
-    this.setTimer = setTimer;
-    this.clearTimer = clearTimer;
-    this.g = null;
-    this.timer = null;
-  }
-
-  start(touches, t) {
-    if (this.g || !touches.length) return;
-    const p = touches[0];
-    this.emit({ t: 'touch' });
-    this.g = { id: p.id, x0: p.x, y0: p.y, x: p.x, y: p.y, t0: t, lastT: t, mode: null };
-    this.timer = this.setTimer(() => this.hold(), this.o.holdMs);
-  }
-
-  hold() {
-    this.timer = null;
-    if (this.g && this.g.mode === null) {
-      this.g.mode = 'held';
-      this.feel('grab');
-    }
-  }
-
-  move(touches, t) {
-    const g = this.g;
-    const p = g && touches.find((q) => q.id === g.id);
-    if (!p) return;
-    const dt = Math.max(t - g.lastT, 1);
-    g.lastT = t;
-    const far = Math.hypot(p.x - g.x0, p.y - g.y0) > this.o.slop;
-    if (g.mode === null && far) {
-      this.clearTimer(this.timer);
-      this.timer = null;
-      g.mode = 'move';
-      this.emit({ t: 'move', dx: p.x - g.x0, dy: p.y - g.y0, dt });
-    } else if (g.mode === 'held' && far) {
-      g.mode = 'drag';
-      this.emit({ t: 'down', b: 'left' });
-      this.emit({ t: 'move', dx: p.x - g.x, dy: p.y - g.y, dt });
-    } else if (g.mode === 'move' || g.mode === 'drag') {
-      this.emit({ t: 'move', dx: p.x - g.x, dy: p.y - g.y, dt });
-    }
-    g.x = p.x;
-    g.y = p.y;
-  }
-
-  end(touches) {
-    const g = this.g;
-    if (!g || touches.some((q) => q.id === g.id)) return;
-    this.clearTimer(this.timer);
-    this.timer = null;
-    this.g = null;
-    if (g.mode === null) {
-      this.emit({ t: 'click', b: 'left' });
-      this.feel('tap');
-    } else if (g.mode === 'held') {
-      this.emit({ t: 'click', b: 'right' });
-      this.feel('tap2');
-    } else if (g.mode === 'drag') {
-      this.emit({ t: 'up', b: 'left' });
-    }
-  }
-
-  cancel() {
-    this.clearTimer(this.timer);
-    if (this.g?.mode === 'drag') this.emit({ t: 'up', b: 'left' });
-    this.g = null;
-  }
-}
-
-// The ribbed scroll strip on the edge of couch mode. Vertical only, with a
-// light tick every few millimetres so you can feel it move.
+// The ribbed scroll strip on the edge of the pad, for scrolling with one
+// thumb. Vertical only, with a light tick every few millimetres you can feel.
 export class StripRecognizer {
   constructor(emit, { feel = () => {}, gain = 1.5, notch = 36 } = {}) {
     this.emit = emit;
@@ -349,7 +311,7 @@ export class StripRecognizer {
     g.y = p.y;
     g.t = t;
     if (!dy) return;
-    this.emit({ t: 'scroll', dx: 0, dy });
+    this.emit({ t: 'scroll', dx: 0, dy, dt, ts: t });
     this.vel.add(t, 0, dy, dt);
     g.travel += Math.abs(dy);
     if (g.travel >= this.notch) {

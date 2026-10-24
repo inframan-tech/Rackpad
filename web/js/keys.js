@@ -11,12 +11,13 @@ const NAV_KEYS = new Set(['return', 'tab', 'esc', 'left', 'right', 'up', 'down']
 
 export class Keys {
   constructor({ root, send, feel, live = true, onLiveChange = () => {} }) {
+    this.root = root;
     this.send = send;
     this.feel = feel;
     this.field = root.querySelector('#type-field');
     this.liveBtn = root.querySelector('#live-toggle');
     this.sendBtn = root.querySelector('#type-send');
-    this.hint = root.querySelector('#type-hint');
+    this.clearBtn = root.querySelector('#type-clear');
     this.sent = '';
     this.composing = false;
     this.mods = new Set();
@@ -31,6 +32,7 @@ export class Keys {
     });
     f.addEventListener('input', () => {
       if (!this.composing) this.sync();
+      this.tidy();
     });
     f.addEventListener('keydown', (e) => this.onKeyDown(e));
 
@@ -38,24 +40,17 @@ export class Keys {
       this.setLive(!this.live);
       this.onLiveChange(this.live);
     });
-    onTap(root.querySelector('#type-clear'), () => this.reset());
+    onTap(this.clearBtn, () => this.reset());
     onTap(this.sendBtn, () => this.submit());
-    for (const b of root.querySelectorAll('#keycaps [data-key]')) onTap(b, () => this.pressKey(b.dataset.key));
-    for (const b of root.querySelectorAll('#keycaps [data-mod]')) onTap(b, () => this.toggleMod(b));
-    for (const b of root.querySelectorAll('#keycaps [data-combo]')) {
-      onTap(b, () => {
-        const parts = b.dataset.combo.split('+');
-        this.send({ t: 'key', k: parts.pop(), mods: parts });
-        this.feel('tap');
-      });
-    }
+    for (const b of root.querySelectorAll('[data-key]')) onTap(b, () => this.pressKey(b.dataset.key));
+    for (const b of root.querySelectorAll('[data-mod]')) onTap(b, () => this.toggleMod(b));
   }
 
   setLive(on) {
     this.live = on;
     this.liveBtn.setAttribute('aria-pressed', String(on));
     this.sendBtn.hidden = on;
-    this.hint.textContent = on ? 'Tap 🎤 on your keyboard to dictate' : 'Write it here, then tap Send';
+    this.field.placeholder = on ? 'Type or dictate' : 'Write it here, then send';
     this.reset();
   }
 
@@ -66,6 +61,12 @@ export class Keys {
   reset() {
     this.field.value = '';
     this.sent = '';
+    this.tidy();
+  }
+
+  // The clear button only shows when there's something to clear.
+  tidy() {
+    this.clearBtn.hidden = !this.field.value;
   }
 
   // Mirror whatever changed since we last looked.
@@ -112,6 +113,7 @@ export class Keys {
       // Delete from the field too, so both stay in step.
       this.field.value = graphemes(this.field.value).slice(0, -1).join('');
       this.sync();
+      this.tidy();
       this.feel('tick');
       return;
     }
@@ -131,6 +133,6 @@ export class Keys {
 
   clearMods() {
     this.mods.clear();
-    for (const b of document.querySelectorAll('#keycaps [data-mod]')) b.setAttribute('aria-pressed', 'false');
+    for (const b of this.root.querySelectorAll('[data-mod]')) b.setAttribute('aria-pressed', 'false');
   }
 }

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="neon">
+<html lang="en" data-surface="black">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
@@ -7,7 +7,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Rackpad">
-<meta name="theme-color" content="#05060f">
+<meta name="theme-color" content="#000000">
 <meta name="format-detection" content="telephone=no">
 <title>Rackpad</title>
 <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
@@ -18,108 +18,62 @@
 <body>
 
 <div class="app" id="app">
-  <header class="topbar">
-    <div class="conn" id="conn" data-state="connecting">
-      <span class="dot"></span><span class="mac" id="mac-name">Connecting…</span>
-    </div>
-    <button class="app-chip" id="app-chip" hidden aria-label="Controls for the app in front">
-      <img id="app-icon" alt=""><span id="app-name"></span>
-    </button>
-    <button class="icon-btn" id="open-settings" aria-label="Settings"><i data-icon="settings"></i></button>
-  </header>
-
-  <div class="banner" id="banner" hidden></div>
-
-  <main class="views">
+  <main class="stage">
     <section class="view" data-view="pad">
-      <div class="surface pad" id="pad">
-        <div class="hint" id="pad-hint">
-          <b>Trackpad</b>
-          <span>Tap to click · tap with two fingers to right-click</span>
-          <span>Two fingers scroll · pinch to zoom</span>
-          <span>Swipe with three fingers for Mission Control and desktops</span>
-          <span>Tap, then touch again and move to drag</span>
-        </div>
-      </div>
-    </section>
-
-    <section class="view" data-view="couch">
-      <div class="couch-wrap" id="couch-wrap">
-        <div class="surface couch" id="couch">
-          <div class="hint">
-            <b>Couch mode</b>
-            <span>One thumb is all you need</span>
-            <span>Tap to click · hold to right-click</span>
-            <span>Hold, then move, to drag</span>
-            <span>Slide on the strip to scroll</span>
+      <div class="pad" id="pad" aria-label="Trackpad">
+        <div class="glass" id="glass">
+          <div class="sheen"></div>
+          <div class="presence" id="presence" data-state="connecting" data-level="wait">
+            <div class="line"><span class="dot"></span><span class="mac" id="mac-name">Connecting…</span></div>
+            <div class="note" id="presence-note"></div>
           </div>
         </div>
-        <div class="strip" id="strip" aria-label="Scroll strip"><span class="strip-arrow">▲</span><span class="strip-arrow">▼</span></div>
       </div>
-      <div class="couch-bar">
-        <button class="round" data-key="esc">esc</button>
-        <button class="round" data-media="voldown" aria-label="Volume down"><i data-icon="volume-1"></i></button>
-        <button class="round big" data-media="playpause" aria-label="Play or pause"><i data-icon="play-pause"></i></button>
-        <button class="round" data-media="volup" aria-label="Volume up"><i data-icon="volume-2"></i></button>
-        <button class="round" data-key="space">space</button>
-      </div>
+      <div class="strip" id="strip" aria-label="Scroll strip"></div>
     </section>
 
     <section class="view" data-view="keys">
-      <div class="type-box">
-        <textarea id="type-field" rows="3" autocapitalize="sentences" autocomplete="off" autocorrect="on" spellcheck="true"
-          enterkeyhint="enter" placeholder="Type or dictate. It appears on your Mac as you type."></textarea>
-        <div class="type-tools">
-          <button class="toggle" id="live-toggle" aria-pressed="true"><span class="led"></span>Live</button>
-          <span class="type-hint" id="type-hint">Tap 🎤 on your keyboard to dictate</span>
-          <button class="pill" id="type-clear">Clear</button>
-          <button class="pill accent" id="type-send" hidden>Send</button>
+      <div class="compose">
+        <textarea id="type-field" rows="2" autocapitalize="sentences" autocomplete="off" autocorrect="on" spellcheck="true"
+          enterkeyhint="enter" placeholder="Type or dictate"></textarea>
+        <div class="compose-tools">
+          <button class="ghost" id="type-clear" aria-label="Clear" hidden><i data-icon="x"></i></button>
+          <button class="live" id="live-toggle" aria-pressed="true"><span class="led"></span>Live</button>
+          <button class="send" id="type-send" aria-label="Send" hidden><i data-icon="arrow-up"></i></button>
         </div>
       </div>
-      <div class="keycaps" id="keycaps">
-        <div class="key-row">
-          <button data-key="esc">esc</button>
-          <button data-key="tab">tab</button>
-          <button data-key="backspace" aria-label="Delete"><i data-icon="backspace"></i></button>
-          <button data-key="return" aria-label="Return"><i data-icon="corner-down-left"></i></button>
-        </div>
-        <div class="key-row mods">
-          <button data-mod="cmd" aria-label="Command">⌘</button>
-          <button data-mod="alt" aria-label="Option">⌥</button>
-          <button data-mod="ctrl" aria-label="Control">⌃</button>
-          <button data-mod="shift" aria-label="Shift">⇧</button>
-        </div>
-        <div class="key-row">
-          <button data-key="left" aria-label="Left"><i data-icon="arrow-left"></i></button>
-          <button data-key="up" aria-label="Up"><i data-icon="arrow-up"></i></button>
-          <button data-key="down" aria-label="Down"><i data-icon="arrow-down"></i></button>
-          <button data-key="right" aria-label="Right"><i data-icon="arrow-right"></i></button>
-        </div>
-        <div class="key-row small">
-          <button data-combo="cmd+z">⌘Z</button>
-          <button data-combo="cmd+a">⌘A</button>
-          <button data-combo="cmd+c">⌘C</button>
-          <button data-combo="cmd+v">⌘V</button>
-        </div>
+      <div class="mini" id="mini-pad" aria-label="Trackpad"><div class="glass"></div></div>
+      <div class="keyrow mods">
+        <button data-mod="cmd" aria-label="Command">⌘</button>
+        <button data-mod="alt" aria-label="Option">⌥</button>
+        <button data-mod="ctrl" aria-label="Control">⌃</button>
+        <button data-mod="shift" aria-label="Shift">⇧</button>
+      </div>
+      <div class="keyrow nav">
+        <button data-key="esc">esc</button>
+        <button data-key="tab">tab</button>
+        <button data-key="left" aria-label="Left"><i data-icon="arrow-left"></i></button>
+        <button data-key="up" aria-label="Up"><i data-icon="arrow-up"></i></button>
+        <button data-key="down" aria-label="Down"><i data-icon="arrow-down"></i></button>
+        <button data-key="right" aria-label="Right"><i data-icon="arrow-right"></i></button>
+        <button data-key="backspace" aria-label="Delete"><i data-icon="backspace"></i></button>
+        <button data-key="return" aria-label="Return"><i data-icon="corner-down-left"></i></button>
       </div>
     </section>
 
-    <section class="view" data-view="wheel">
-      <div class="lcd">
-        <div class="lcd-row"><span id="lcd-label">♪ Volume</span><span id="vol-pct">–</span></div>
-        <div class="lcd-bar"><div id="vol-fill"></div></div>
+    <section class="view" data-view="remote">
+      <div class="readout" id="readout">
+        <span class="vol" id="vol-pct">–</span>
+        <div class="vol-bar"><div id="vol-fill"></div></div>
       </div>
-      <div class="wheel-area">
-        <div class="wheel" id="wheel">
-          <span class="wl top" data-zone="top">MENU</span>
-          <span class="wl left" data-zone="left"><i data-icon="skip-back"></i></span>
-          <span class="wl right" data-zone="right"><i data-icon="skip-forward"></i></span>
-          <span class="wl bottom" data-zone="bottom"><i data-icon="play-pause"></i></span>
-          <div class="wheel-dot" id="wheel-dot"></div>
-          <div class="wheel-center" id="wheel-center"></div>
-        </div>
+      <div class="wheel" id="wheel" aria-label="Click wheel">
+        <span class="wl top" data-zone="top">MENU</span>
+        <span class="wl left" data-zone="left"><i data-icon="skip-back"></i></span>
+        <span class="wl right" data-zone="right"><i data-icon="skip-forward"></i></span>
+        <span class="wl bottom" data-zone="bottom"><i data-icon="play-pause"></i></span>
+        <div class="wheel-dot" id="wheel-dot"></div>
+        <div class="wheel-center" id="wheel-center"></div>
       </div>
-      <p class="wheel-hint">Turn for volume · centre plays/pauses · MENU mutes</p>
     </section>
 
     <section class="view" data-view="app">
@@ -127,61 +81,88 @@
     </section>
   </main>
 
-  <nav class="smart-strip" id="smart-strip" aria-label="Quick controls"></nav>
-
-  <nav class="tabbar" id="tabbar" role="tablist">
-    <button role="tab" data-tab="pad"><i data-icon="trackpad"></i><span>Pad</span></button>
-    <button role="tab" data-tab="couch"><i data-icon="sofa"></i><span>Couch</span></button>
-    <button role="tab" data-tab="keys"><i data-icon="keyboard"></i><span>Keys</span></button>
-    <button role="tab" data-tab="wheel"><i data-icon="wheel"></i><span>Wheel</span></button>
-    <button role="tab" data-tab="app"><i data-icon="grid"></i><span id="tab-app-label">App</span></button>
+  <nav class="dock" id="dock" role="tablist">
+    <button role="tab" data-tab="pad" aria-label="Trackpad"><i data-icon="trackpad"></i></button>
+    <button role="tab" data-tab="keys" aria-label="Keyboard"><i data-icon="keyboard"></i></button>
+    <button role="tab" data-tab="remote" aria-label="Remote"><i data-icon="wheel"></i></button>
+    <button role="tab" data-tab="app" id="app-tab" aria-label="App controls"><img class="app-ic" id="app-icon" alt="" hidden><i data-icon="grid" id="app-fallback"></i></button>
+    <button id="open-settings" aria-label="Settings"><i data-icon="sliders"></i></button>
   </nav>
+
+  <button class="side-key" id="side-key" aria-label="Keyboard" aria-pressed="false"><i data-icon="keyboard"></i></button>
+  <div class="ping" id="ping" data-level="wait" aria-label="Round trip to your Mac"><span class="dot"></span><span id="ping-ms">–</span></div>
 </div>
 
-<canvas class="trails" id="trails"></canvas>
+<canvas class="glow" id="glow"></canvas>
 
 <div class="backdrop" id="backdrop" hidden></div>
 
 <section class="sheet" id="settings" hidden aria-label="Settings">
-  <div class="grab"></div>
-  <h2>Settings</h2>
-  <div class="field">
-    <span class="label">Theme</span>
-    <div class="themes" id="theme-picker"></div>
+  <header class="sheet-head"><h2>Settings</h2><button class="done" id="settings-done">Done</button></header>
+  <div class="group">
+    <div class="row"><span>Accent</span><div class="accents" id="accent-picker"></div></div>
+    <div class="row"><span>Surface</span><div class="seg" id="surface-picker"></div></div>
   </div>
-  <div class="field">
-    <label class="label" for="s-pointer">Pointer speed <output id="o-pointer"></output></label>
-    <input type="range" id="s-pointer" min="0.4" max="2.5" step="0.05">
+  <div class="group">
+    <label class="slider"><span>Pointer speed</span><output id="o-pointer"></output><input type="range" id="s-pointer" min="0.4" max="2.5" step="0.05"></label>
+    <label class="slider"><span>Scroll speed</span><output id="o-scroll"></output><input type="range" id="s-scroll" min="0.4" max="2.5" step="0.05"></label>
   </div>
-  <div class="field">
-    <label class="label" for="s-scroll">Scroll speed <output id="o-scroll"></output></label>
-    <input type="range" id="s-scroll" min="0.4" max="2.5" step="0.05">
+  <div class="group">
+    <label class="row sw"><span>Natural scrolling</span><input type="checkbox" switch id="s-natural"></label>
+    <div class="row"><span>Scroll strip</span><div class="seg" id="strip-picker"></div></div>
+    <label class="row sw"><span>Touch glow</span><input type="checkbox" switch id="s-glow"></label>
+    <label class="row sw"><span>Cursor glow on Mac</span><input type="checkbox" switch id="s-beacon"></label>
+    <label class="row sw"><span>Click ripples on Mac</span><input type="checkbox" switch id="s-ripples"></label>
+    <label class="row sw"><span>Haptics</span><input type="checkbox" switch id="s-haptics"></label>
   </div>
-  <div class="switches">
-    <label class="sw"><span>Natural scrolling</span><input type="checkbox" switch id="s-natural"></label>
-    <label class="sw"><span>Neon trails</span><input type="checkbox" switch id="s-trails"></label>
-    <label class="sw"><span>Click ripples on the Mac</span><input type="checkbox" switch id="s-ripples"></label>
-    <label class="sw"><span>Cursor beacon on the Mac</span><input type="checkbox" switch id="s-beacon"></label>
-    <label class="sw"><span>Haptics</span><input type="checkbox" switch id="s-haptics"></label>
-    <label class="sw"><span>Scroll strip on the left</span><input type="checkbox" switch id="s-left"></label>
+  <div class="group">
+    <button class="row link" id="open-secure"><span>Secure connection</span><span class="row-value"><span id="secure-state">Off</span><i data-icon="chevron-right"></i></span></button>
   </div>
+  <details class="group gestures">
+    <summary class="row"><span>Gestures</span><i data-icon="chevron-right"></i></summary>
+    <dl>
+      <dt>Tap</dt><dd>Click</dd>
+      <dt>Two-finger tap, or hold</dt><dd>Right-click</dd>
+      <dt>Hold, then move</dt><dd>Drag</dd>
+      <dt>Tap, then touch and move</dt><dd>Drag</dd>
+      <dt>Two fingers</dt><dd>Scroll</dd>
+      <dt>Pinch</dt><dd>Zoom</dd>
+      <dt>Three fingers up</dt><dd>Mission Control</dd>
+      <dt>Three fingers down</dt><dd>App windows</dd>
+      <dt>Three fingers left, right</dt><dd>Switch desktops</dd>
+      <dt>Turn the phone sideways</dt><dd>Full-size trackpad</dd>
+    </dl>
+  </details>
   <p class="about" id="about"></p>
-  <button class="pill accent wide" id="settings-done">Done</button>
+</section>
+
+<section class="sheet" id="secure" hidden aria-label="Secure connection">
+  <header class="sheet-head"><h2>Secure connection</h2><button class="done" id="secure-done">Done</button></header>
+  <p class="lead" id="secure-lead">Lets Rackpad use the microphone and the live camera. Once per phone, about a minute. Everything stays on your Wi-Fi.</p>
+  <ol class="steps" id="secure-steps">
+    <li><div><b>Download Rackpad's certificate</b><small id="secure-dl-note">Safari asks to allow a configuration profile: tap Allow.</small></div><a class="pill" id="secure-download" href="/rackpad.crt">Download</a></li>
+    <li data-os="ios"><div><b>Install it</b><small>Settings → General → VPN &amp; Device Management → <span class="ca-name">Rackpad Local CA</span> → Install</small></div></li>
+    <li data-os="ios"><div><b>Trust it</b><small>Settings → General → About → Certificate Trust Settings → switch on <span class="ca-name">Rackpad Local CA</span></small></div></li>
+    <li data-os="android" hidden><div><b>Install it</b><small>Settings → Security → More security settings → Encryption &amp; credentials → Install a certificate → CA certificate → pick Rackpad.crt</small></div></li>
+  </ol>
+  <button class="cta" id="secure-open" disabled>Checking…</button>
+  <p class="about" id="secure-note">Then add the secure Rackpad to your Home Screen, and delete the old icon.</p>
 </section>
 
 <section class="sheet" id="install" hidden aria-label="Add to Home Screen">
-  <div class="grab"></div>
-  <h2>Put Rackpad on your Home Screen</h2>
-  <p>Tap <span class="inline-ic" data-icon="share"></span> <b>Share</b>, then <b>Add to Home Screen</b>.</p>
-  <p class="muted">The icon connects to your Mac by itself from then on, at home and at the office.</p>
-  <button class="pill accent wide" id="install-done">Got it</button>
+  <img class="install-art" src="/icons/apple-touch-icon.png" alt="" width="64" height="64">
+  <h2>Make it full screen</h2>
+  <p>Tap <span class="inline-ic" data-icon="share"></span> <b>Share</b>, then <b>Add to Home Screen</b>. Rackpad then opens from its own icon with no browser bars, and finds your Mac by itself.</p>
+  <button class="cta" id="install-done">Got it</button>
 </section>
 
 <div class="pairing" id="pairing" hidden>
-  <img src="/icons/icon.svg" alt="" width="88" height="88">
+  <img src="/icons/apple-touch-icon.png" alt="" width="72" height="72">
   <h1>Rackpad</h1>
-  <p id="pairing-msg">Start Rackpad on your Mac, then scan the QR code it shows with your phone's camera.</p>
-  <code>npm start</code>
+  <p id="pairing-msg">Scan the QR code on your Mac to pair this phone.</p>
+  <label class="cta scan" for="scan-input"><i data-icon="scan"></i>Scan QR code</label>
+  <input class="offscreen" type="file" id="scan-input" accept="image/*" capture="environment">
+  <p class="pair-hint">No code on your Mac? Start Rackpad there with <code>npm start</code>.</p>
 </div>
 
 <script type="module" src="/js/main.js"></script>

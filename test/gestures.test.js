@@ -1,13 +1,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { TrackpadRecognizer, CouchRecognizer, StripRecognizer, Velocity } from '../web/js/gestures.js';
+import { TrackpadRecognizer, StripRecognizer, Velocity } from '../web/js/gestures.js';
 
 const P = (id, x, y) => ({ id, x, y });
 
-function trackpad(opts) {
+// The hold timer is under the test's control: `hold()` fires it.
+function trackpad(opts = {}) {
   const out = [];
-  const rec = new TrackpadRecognizer((m) => out.push(m), opts);
-  return { rec, out, types: () => out.map((m) => m.t) };
+  const felt = [];
+  let fire = null;
+  const rec = new TrackpadRecognizer((m) => out.push(m), {
+    feel: (k) => felt.push(k),
+    setTimer: (fn) => ((fire = fn), 1),
+    clearTimer: () => (fire = null),
+    ...opts,
+  });
+  return { rec, out, felt, types: () => out.map((m) => m.t), hold: () => fire?.() };
 }
 
 test('a quick tap clicks', () => {
@@ -18,10 +26,10 @@ test('a quick tap clicks', () => {
   assert.deepEqual(out, [{ t: 'touch' }, { t: 'click', b: 'left' }]);
 });
 
-test('a long press is not a click', () => {
+test('a slow press that never became a hold does nothing', () => {
   const { rec, types } = trackpad();
   rec.start([P(1, 100, 100)], 0);
-  rec.end([], 600);
+  rec.end([], 400);
   assert.deepEqual(types(), ['touch']);
 });
 
@@ -36,6 +44,7 @@ test('one finger moves the pointer without losing the first few px', () => {
   assert.equal(moves.length, 2);
   assert.equal(moves[0].dx + moves[1].dx, 20);
   assert.equal(moves[0].dy + moves[1].dy, 4);
+  assert.deepEqual(moves.map((m) => [m.ts, m.dt]), [[32, 16], [48, 16]], 'each move says when the finger was there');
   assert.ok(!out.some((m) => m.t === 'click'), 'moving is not a click');
 });
 
@@ -137,52 +146,49 @@ test('cancel releases a drag', () => {
   assert.equal(out.at(-1).t, 'up');
 });
 
-// ── Couch mode ────────────────────────────────────────────────────────────
+// ── Holding, for one thumb ────────────────────────────────────────────────
 
-function couch() {
-  const out = [];
-  let fire = null;
-  const rec = new CouchRecognizer((m) => out.push(m), {
-    setTimer: (fn) => ((fire = fn), 1),
-    clearTimer: () => (fire = null),
-  });
-  return { rec, out, hold: () => fire?.() };
-}
-
-test('couch: tap clicks', () => {
-  const { rec, out } = couch();
+test('hold, then let go, right-clicks', () => {
+  const { rec, out, felt, hold } = trackpad();
   rec.start([P(1, 50, 50)], 0);
-  rec.end([], 100);
-  assert.deepEqual(out.map((m) => m.t + (m.b ? `:${m.b}` : '')), ['touch', 'click:left']);
-});
-
-test('couch: long-press then release right-clicks', () => {
-  const { rec, out, hold } = couch();
-  rec.start([P(1, 50, 50)], 0);
+  rec.move([P(1, 52, 51)], 200); // a resting thumb drifts a little
   hold();
   rec.end([], 600);
   assert.deepEqual(out.at(-1), { t: 'click', b: 'right' });
+  assert.deepEqual(felt, ['grab', 'tap2']);
 });
 
-test('couch: hold then move drags', () => {
-  const { rec, out, hold } = couch();
+test('hold, then move, drags from where the finger was held', () => {
+  const { rec, out, hold } = trackpad();
   rec.start([P(1, 50, 50)], 0);
   hold();
-  rec.move([P(1, 70, 50)], 500);
-  rec.move([P(1, 90, 60)], 520);
-  rec.end([], 540);
+  rec.move([P(1, 54, 50)], 500); // drift under the slop doesn't start the drag
+  rec.move([P(1, 70, 50)], 520);
+  rec.move([P(1, 90, 60)], 540);
+  rec.end([], 560);
   assert.deepEqual(out.map((m) => m.t), ['touch', 'down', 'move', 'move', 'up']);
   const dx = out.filter((m) => m.t === 'move').reduce((s, m) => s + m.dx, 0);
   assert.equal(dx, 40);
 });
 
-test('couch: moving right away just moves (no hold, no click)', () => {
-  const { rec, out, hold } = couch();
+test('moving right away just moves: the hold never happens', () => {
+  const { rec, out, hold } = trackpad();
   rec.start([P(1, 50, 50)], 0);
   rec.move([P(1, 80, 50)], 30);
-  hold(); // timer was cancelled; must be a no-op
+  hold(); // too late: the finger already travelled past the slop
   rec.end([], 600);
   assert.deepEqual(out.map((m) => m.t), ['touch', 'move']);
+});
+
+test('a second finger turns a hold into a two-finger gesture', () => {
+  const { rec, out, hold } = trackpad();
+  rec.start([P(1, 100, 300)], 0);
+  hold();
+  rec.start([P(1, 100, 300), P(2, 160, 300)], 520);
+  for (let i = 1; i <= 6; i++) rec.move([P(1, 100, 300 - i * 12), P(2, 160, 300 - i * 12)], 520 + i * 16);
+  rec.end([], 640);
+  assert.ok(out.some((m) => m.t === 'scroll'));
+  assert.ok(!out.some((m) => m.t === 'click' || m.t === 'down'));
 });
 
 test('strip scrolls vertically and flicks', () => {
