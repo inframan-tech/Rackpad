@@ -1,0 +1,929 @@
+// RackpadHelper — the native half of Rackpad.
+//
+// Reads one JSON command per line on stdin (sent by the Node server), posts
+// the matching mouse/keyboard events, draws the cursor beacon and click
+// ripples, and reports the frontmost app on stdout as JSON lines. When the
+// phone watches the screen, H.264 frames go out on file descriptor 3.
+//
+// Build: swiftc -O -swift-version 5 -o rackpad-helper RackpadHelper.swift
+// (the Node server does this automatically on first run).
+
+import AppKit
+import ApplicationServices
+import Carbon
+import CoreMedia
+import IOKit.pwr_mgt
+import QuartzCore
+@preconcurrency import ScreenCaptureKit
+import VideoToolbox
+
+// MARK: - Output to Node
+
+let outQueue = DispatchQueue(label: "rackpad.stdout")
+
+func emit(_ obj: [String: Any]) {
+    guard var data = try? JSONSerialization.data(withJSONObject: obj) else { return }
+    data.append(0x0A)
+    outQueue.async { FileHandle.standardOutput.write(data) }
+}
+
+func num(_ v: Any?) -> Double {
+    guard let n = v as? NSNumber else { return 0 }
+    let d = n.doubleValue
+    return d.isFinite ? max(-100_000, min(100_000, d)) : 0
+}
+
+func int32(_ v: Any?) -> Int32 { Int32(num(v).rounded()) }
+
+func parseColor(hex: String?, fallback: NSColor) -> NSColor {
+    guard let hex = hex, hex.count == 7, hex.hasPrefix("#"), let v = UInt32(hex.dropFirst(), radix: 16) else { return fallback }
+    return NSColor(srgbRed: CGFloat((v >> 16) & 0xFF) / 255, green: CGFloat((v >> 8) & 0xFF) / 255, blue: CGFloat(v & 0xFF) / 255, alpha: 1)
+}
+
+func now() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+// MARK: - Keyboard layout
+
+/// Maps characters to key codes on the user's current keyboard layout, so a
+/// shortcut like Cmd+Z presses the key labelled Z even on AZERTY or QWERTZ.
+final class KeyboardLayout {
+    private var map: [String: (code: CGKeyCode, shift: Bool)] = [:]
+    private let lock = NSLock()
+
+    init() {
+        rebuild()
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
+            object: nil, queue: .main
+        ) { [weak self] _ in self?.rebuild() }
+    }
+
+    func rebuild() {
+        var fresh: [String: (code: CGKeyCode, shift: Bool)] = [:]
+        if let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+           let raw = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) {
+            let data = Unmanaged<CFData>.fromOpaque(raw).takeUnretainedValue()
+            if let bytes = CFDataGetBytePtr(data) {
+                let layout = UnsafeRawPointer(bytes).assumingMemoryBound(to: UCKeyboardLayout.self)
+                // Unshifted first so they win when a character appears twice.
+                for shift in [false, true] {
+                    let modifiers: UInt32 = shift ? UInt32(shiftKey >> 8) & 0xFF : 0
+                    for code in 0..<128 {
+                        var dead: UInt32 = 0
+                        var length = 0
+                        var chars = [UniChar](repeating: 0, count: 4)
+                        let status = UCKeyTranslate(layout, UInt16(code), UInt16(kUCKeyActionDown), modifiers,
+                                                    UInt32(LMGetKbdType()), OptionBits(1 << kUCKeyTranslateNoDeadKeysBit),
+                                                    &dead, chars.count, &length, &chars)
+                        guard status == noErr, length > 0 else { continue }
+                        let s = String(utf16CodeUnits: chars, count: length)
+                        if fresh[s] == nil { fresh[s] = (CGKeyCode(code), shift) }
+                    }
+                }
+            }
+        }
+        lock.lock(); map = fresh; lock.unlock()
+    }
+
+    func lookup(_ s: String) -> (code: CGKeyCode, shift: Bool)? {
+        lock.lock(); defer { lock.unlock() }
+        return map[s]
+    }
+}
+
+// MARK: - Input events
+
+final class Input {
+    let source = CGEventSource(stateID: .hidSystemState)
+    let layout = KeyboardLayout()
+    private var pos = CGEvent(source: nil)?.location ?? .zero
+    private var deltaCarry = CGPoint.zero // fractions of a pixel not yet reported as a delta
+    private var lastPost: TimeInterval = 0
+    private var leftDown = false, rightDown = false, otherDown = false
+    private var displays: [CGRect] = []
+
+    init() {
+        refreshDisplays()
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.refreshDisplays()
+        }
+    }
+
+    func refreshDisplays() {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return }
+        let capacity = count
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(capacity))
+        guard CGGetActiveDisplayList(capacity, &ids, &count) == .success else { return }
+        displays = ids.prefix(Int(count)).map { CGDisplayBounds($0) }
+    }
+
+    /// Where the pointer is. Our own last position while we're actively moving
+    /// it (the system's reading can lag a few ms behind), otherwise the real one
+    /// so we pick up any movement from a physical mouse.
+    private func base() -> CGPoint {
+        if now() - lastPost > 0.1, let actual = CGEvent(source: nil)?.location { pos = actual }
+        return pos
+    }
+
+    private func clamp(_ p: CGPoint, from b: CGPoint) -> CGPoint {
+        if displays.isEmpty || displays.contains(where: { $0.contains(p) }) { return p }
+        let r = displays.first(where: { $0.contains(b) }) ?? displays[0]
+        return CGPoint(x: min(max(p.x, r.minX), r.maxX - 1), y: min(max(p.y, r.minY), r.maxY - 1))
+    }
+
+    func move(dx: Double, dy: Double) {
+        let b = base()
+        post(to: clamp(CGPoint(x: b.x + dx, y: b.y + dy), from: b), dx: dx, dy: dy)
+    }
+
+    /// Puts the pointer at a point (global display coordinates): a tap on the
+    /// streamed screen lands right there.
+    func moveTo(_ target: CGPoint) {
+        let b = base()
+        let p = clamp(target, from: b)
+        post(to: p, dx: p.x - b.x, dy: p.y - b.y)
+    }
+
+    private func post(to p: CGPoint, dx: Double, dy: Double) {
+        let type: CGEventType
+        let button: CGMouseButton
+        if leftDown { type = .leftMouseDragged; button = .left }
+        else if rightDown { type = .rightMouseDragged; button = .right }
+        else if otherDown { type = .otherMouseDragged; button = .center }
+        else { type = .mouseMoved; button = .left }
+        guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: button) else { return }
+        // Movement comes in small fractional steps; apps that read whole-pixel
+        // deltas (games, remote desktops) get them with nothing lost.
+        deltaCarry.x += dx
+        deltaCarry.y += dy
+        let ix = deltaCarry.x.rounded(.towardZero)
+        let iy = deltaCarry.y.rounded(.towardZero)
+        deltaCarry.x -= ix
+        deltaCarry.y -= iy
+        e.setIntegerValueField(.mouseEventDeltaX, value: Int64(ix))
+        e.setIntegerValueField(.mouseEventDeltaY, value: Int64(iy))
+        e.post(tap: .cghidEventTap)
+        pos = p
+        lastPost = now()
+    }
+
+    func button(_ name: String, down: Bool, clicks: Int) {
+        let p = base()
+        let type: CGEventType
+        let button: CGMouseButton
+        switch name {
+        case "right":
+            type = down ? .rightMouseDown : .rightMouseUp; button = .right; rightDown = down
+        case "middle":
+            type = down ? .otherMouseDown : .otherMouseUp; button = .center; otherDown = down
+        default:
+            type = down ? .leftMouseDown : .leftMouseUp; button = .left; leftDown = down
+        }
+        guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: button) else { return }
+        e.setIntegerValueField(.mouseEventClickState, value: Int64(max(1, clicks)))
+        if name == "middle" { e.setIntegerValueField(.mouseEventButtonNumber, value: 2) }
+        e.post(tap: .cghidEventTap)
+        lastPost = now()
+    }
+
+    /// Pixel-precise, continuous scrolling like a trackpad (not wheel "lines").
+    func scroll(dx: Int32, dy: Int32) {
+        guard let e = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: dy, wheel2: dx, wheel3: 0) else { return }
+        e.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        e.post(tap: .cghidEventTap)
+    }
+
+    private static let modifierKeys: [(name: String, code: CGKeyCode, flag: CGEventFlags)] = [
+        ("ctrl", 59, .maskControl), ("alt", 58, .maskAlternate), ("shift", 56, .maskShift),
+        ("cmd", 55, .maskCommand), ("fn", 63, .maskSecondaryFn),
+    ]
+
+    private func postKey(_ code: CGKeyCode, down: Bool, flags: CGEventFlags) {
+        guard let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { return }
+        e.flags = flags
+        e.post(tap: .cghidEventTap)
+    }
+
+    /// Presses a key with modifiers, holding the modifier keys down around it
+    /// the way a person would (some apps watch the modifier keys themselves).
+    func key(code fallback: CGKeyCode, char: String?, mods: [String], times: Int) {
+        var code = fallback
+        var wanted = Set(mods)
+        if let c = char, let mapped = layout.lookup(c) {
+            code = mapped.code
+            if mapped.shift { wanted.insert("shift") }
+        }
+        let held = Input.modifierKeys.filter { wanted.contains($0.name) }
+        var flags = CGEventFlags()
+        for m in held { flags.insert(m.flag); postKey(m.code, down: true, flags: flags) }
+        var keyFlags = flags
+        // Arrows and the navigation block carry these flags on real keyboards;
+        // Mission Control's Ctrl+Arrow shortcuts ignore events without them.
+        if (115...126).contains(code) || code == 117 { keyFlags.insert(.maskSecondaryFn) }
+        if (123...126).contains(code) { keyFlags.insert(.maskNumericPad) }
+        for _ in 0..<max(1, min(times, 500)) {
+            postKey(code, down: true, flags: keyFlags)
+            postKey(code, down: false, flags: keyFlags)
+            if times > 1 { usleep(2000) }
+        }
+        for m in held.reversed() { flags.remove(m.flag); postKey(m.code, down: false, flags: flags) }
+    }
+
+    /// Types arbitrary text (emoji, accents, any language) one character at a time.
+    func type(_ text: String) {
+        for ch in text {
+            if ch.isNewline { key(code: 36, char: nil, mods: [], times: 1); continue }
+            if ch == "\t" { key(code: 48, char: nil, mods: [], times: 1); continue }
+            let s = String(ch)
+            let units = Array(s.utf16)
+            // Use the real key when the layout has one: apps that read key
+            // codes (terminals, games, remote desktops) then see the right key.
+            let mapped = layout.lookup(s)
+            let code = mapped?.code ?? 0
+            let flags: CGEventFlags = mapped?.shift == true ? .maskShift : []
+            for down in [true, false] {
+                guard let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { continue }
+                e.flags = flags
+                e.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
+                e.post(tap: .cghidEventTap)
+            }
+            usleep(1000)
+        }
+    }
+}
+
+// MARK: - Media keys
+
+/// Media keys behave exactly like the keyboard's own: they show the volume
+/// HUD and control whichever app owns Now Playing.
+func postMediaKey(_ name: String) {
+    let codes: [String: Int] = ["volup": 0, "voldown": 1, "mute": 7, "playpause": 16, "next": 17, "prev": 18]
+    guard let key = codes[name] else { return }
+    for down in [true, false] {
+        let flags = NSEvent.ModifierFlags(rawValue: down ? 0xA00 : 0xB00)
+        let data1 = (key << 16) | ((down ? 0xA : 0xB) << 8)
+        let ev = NSEvent.otherEvent(with: .systemDefined, location: .zero, modifierFlags: flags, timestamp: 0,
+                                    windowNumber: 0, context: nil, subtype: 8, data1: data1, data2: -1)
+        ev?.cgEvent?.post(tap: .cghidEventTap)
+    }
+}
+
+func openMissionControl() {
+    for path in ["/System/Applications/Mission Control.app", "/Applications/Mission Control.app"]
+    where FileManager.default.fileExists(atPath: path) {
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        return
+    }
+}
+
+// MARK: - Overlays
+
+func makeOverlayWindow(size: CGFloat) -> NSWindow {
+    let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: size, height: size), styleMask: [.borderless],
+                     backing: .buffered, defer: false)
+    w.isOpaque = false
+    w.backgroundColor = .clear
+    w.hasShadow = false
+    w.ignoresMouseEvents = true
+    w.isReleasedWhenClosed = false
+    w.level = .screenSaver
+    w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+    let view = NSView(frame: NSRect(x: 0, y: 0, width: size, height: size))
+    view.wantsLayer = true
+    w.contentView = view
+    return w
+}
+
+/// A soft glow that follows the pointer while the phone is driving it, so you
+/// can find the cursor from across the room. It pulses in after a pause.
+final class Beacon {
+    var enabled = true
+    var color = NSColor(srgbRed: 0, green: 0.9, blue: 1, alpha: 1) { didSet { applyColor() } }
+    private let size: CGFloat = 200
+    private lazy var window: NSWindow = {
+        let w = makeOverlayWindow(size: self.size)
+        self.setUpLayers(in: w)
+        return w
+    }()
+    private let glow = CAGradientLayer()
+    private let rim = CAShapeLayer()
+    private let ring = CAShapeLayer()
+    private var follow: Timer?
+    private var lastActivity: TimeInterval = 0
+    private var visible = false
+
+    private func setUpLayers(in w: NSWindow) {
+        guard let root = w.contentView?.layer else { return }
+        let bounds = CGRect(x: 0, y: 0, width: size, height: size)
+        glow.type = .radial
+        glow.frame = bounds
+        glow.startPoint = CGPoint(x: 0.5, y: 0.5)
+        glow.endPoint = CGPoint(x: 1, y: 1)
+        glow.locations = [0, 0.28, 1]
+        ring.frame = bounds
+        let r: CGFloat = 24
+        ring.path = CGPath(ellipseIn: CGRect(x: size / 2 - r, y: size / 2 - r, width: r * 2, height: r * 2), transform: nil)
+        ring.fillColor = nil
+        ring.lineWidth = 3
+        ring.shadowOffset = .zero
+        ring.shadowRadius = 8
+        ring.shadowOpacity = 1
+        // A dark rim under the ring keeps it visible on white windows too.
+        rim.frame = bounds
+        rim.path = ring.path
+        rim.fillColor = nil
+        rim.lineWidth = 6
+        rim.strokeColor = NSColor.black.withAlphaComponent(0.3).cgColor
+        root.addSublayer(glow)
+        root.addSublayer(rim)
+        root.addSublayer(ring)
+        root.opacity = 0
+        applyColor()
+    }
+
+    private func applyColor() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        glow.colors = [color.withAlphaComponent(0.42).cgColor, color.withAlphaComponent(0.16).cgColor, color.withAlphaComponent(0).cgColor]
+        ring.strokeColor = color.withAlphaComponent(0.95).cgColor
+        ring.shadowColor = color.cgColor
+        CATransaction.commit()
+    }
+
+    /// Called whenever the phone moves the pointer.
+    func poke() {
+        guard enabled else { return }
+        let t = now()
+        let afterPause = t - lastActivity > 2.5
+        lastActivity = t
+        if !visible { show(pulse: afterPause) }
+    }
+
+    private func show(pulse: Bool) {
+        visible = true
+        reposition()
+        window.orderFrontRegardless()
+        guard let root = window.contentView?.layer else { return }
+        root.removeAllAnimations()
+        root.opacity = 1
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0
+        fade.toValue = 1
+        fade.duration = 0.15
+        root.add(fade, forKey: "fade")
+        if pulse {
+            let grow = CABasicAnimation(keyPath: "transform.scale")
+            grow.fromValue = 3.2
+            grow.toValue = 1
+            grow.duration = 0.5
+            grow.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            ring.add(grow, forKey: "pulse")
+            rim.add(grow, forKey: "pulse")
+        }
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.frame() }
+        RunLoop.main.add(timer, forMode: .common)
+        follow = timer
+    }
+
+    private func frame() {
+        reposition()
+        if now() - lastActivity > 1.4 { hide() }
+    }
+
+    private func reposition() {
+        let m = NSEvent.mouseLocation
+        window.setFrameOrigin(NSPoint(x: m.x - size / 2, y: m.y - size / 2))
+    }
+
+    func hide() {
+        guard visible else { return }
+        visible = false
+        follow?.invalidate()
+        follow = nil
+        guard let root = window.contentView?.layer else { return }
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { [weak self] in
+            guard let self = self, !self.visible else { return }
+            self.window.orderOut(nil)
+        }
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 1
+        fade.toValue = 0
+        fade.duration = 0.35
+        root.opacity = 0
+        root.add(fade, forKey: "fade")
+        CATransaction.commit()
+    }
+}
+
+/// A ring that ripples out from the pointer on every click from the phone.
+final class Ripples {
+    var enabled = true
+    var color = NSColor(srgbRed: 0, green: 0.9, blue: 1, alpha: 1)
+    var color2 = NSColor(srgbRed: 1, green: 0.24, blue: 0.95, alpha: 1)
+    private let size: CGFloat = 150
+    private var pool: [NSWindow] = []
+
+    func fire(secondary: Bool) {
+        guard enabled else { return }
+        let w = pool.popLast() ?? makeOverlayWindow(size: size)
+        let m = NSEvent.mouseLocation
+        w.setFrameOrigin(NSPoint(x: m.x - size / 2, y: m.y - size / 2))
+        guard let root = w.contentView?.layer else { return }
+        root.sublayers?.forEach { $0.removeFromSuperlayer() }
+        let c = secondary ? color2 : color
+        let path = CGPath(ellipseIn: root.bounds.insetBy(dx: 10, dy: 10), transform: nil)
+        let rim = CAShapeLayer()
+        rim.frame = root.bounds
+        rim.path = path
+        rim.fillColor = nil
+        rim.strokeColor = NSColor.black.withAlphaComponent(0.25).cgColor
+        rim.lineWidth = 6
+        rim.opacity = 0
+        root.addSublayer(rim)
+        let ring = CAShapeLayer()
+        ring.frame = root.bounds
+        ring.path = path
+        ring.fillColor = c.withAlphaComponent(0.14).cgColor
+        ring.strokeColor = c.cgColor
+        ring.lineWidth = 3
+        ring.shadowColor = c.cgColor
+        ring.shadowRadius = 6
+        ring.shadowOpacity = 1
+        ring.shadowOffset = .zero
+        ring.opacity = 0
+        root.addSublayer(ring)
+        w.orderFrontRegardless()
+
+        CATransaction.begin()
+        CATransaction.setCompletionBlock { [weak self] in
+            w.orderOut(nil)
+            self?.pool.append(w)
+        }
+        let scale = CABasicAnimation(keyPath: "transform.scale")
+        scale.fromValue = 0.12
+        scale.toValue = 1
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 1
+        fade.toValue = 0
+        let group = CAAnimationGroup()
+        group.animations = [scale, fade]
+        group.duration = 0.5
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        ring.add(group, forKey: "ripple")
+        rim.add(group, forKey: "ripple")
+        CATransaction.commit()
+    }
+}
+
+// MARK: - Frontmost app
+
+/// Tells Node which app is in front (and its window title, which is how the
+/// smart layout spots Google Meet or YouTube inside a browser).
+final class AppWatcher {
+    private var lastBundle: String?
+    private var lastTitle: String?
+    private var icons: [String: String] = [:]
+
+    func start() {
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.report()
+        }
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.report() }
+        RunLoop.main.add(timer, forMode: .common)
+        report(force: true)
+    }
+
+    func report(force: Bool = false) {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return }
+        let bundle = app.bundleIdentifier ?? ""
+        let title = AXIsProcessTrusted() ? windowTitle(pid: app.processIdentifier) : nil
+        if !force && bundle == lastBundle && title == lastTitle { return }
+        lastBundle = bundle
+        lastTitle = title
+        var obj: [String: Any] = ["ev": "app", "bundleId": bundle, "name": app.localizedName ?? bundle]
+        if let t = title { obj["title"] = t }
+        if let icon = icon(for: app, key: bundle) { obj["icon"] = icon }
+        emit(obj)
+    }
+
+    private func windowTitle(pid: pid_t) -> String? {
+        let axApp = AXUIElementCreateApplication(pid)
+        var window: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &window) == .success,
+              let w = window, CFGetTypeID(w) == AXUIElementGetTypeID() else { return nil }
+        var title: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(w as! AXUIElement, kAXTitleAttribute as CFString, &title) == .success else { return nil }
+        return title as? String
+    }
+
+    private func icon(for app: NSRunningApplication, key: String) -> String? {
+        if let cached = icons[key] { return cached }
+        guard let image = app.icon else { return nil }
+        let px = 96
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px, bitsPerSample: 8,
+                                         samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+        rep.size = NSSize(width: px, height: px)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        image.draw(in: NSRect(x: 0, y: 0, width: px, height: px), from: .zero, operation: .copy, fraction: 1)
+        NSGraphicsContext.restoreGraphicsState()
+        guard let png = rep.representation(using: .png, properties: [:]) else { return nil }
+        let url = "data:image/png;base64," + png.base64EncodedString()
+        icons[key] = url
+        return url
+    }
+}
+
+// MARK: - Screen streaming
+
+/// Hardware H.264 for WebRTC: constrained baseline (every phone decodes it),
+/// no B-frames, low-latency rate control, a keyframe at least every 2 s and
+/// whenever asked. Each access unit comes out as 4-byte-length-prefixed NAL
+/// units, with SPS and PPS in front of every keyframe.
+final class H264Encoder {
+    typealias Output = (_ au: Data, _ keyframe: Bool, _ ptsMicros: Int64) -> Void
+    private let session: VTCompressionSession
+    private let output: Output
+    private var forceKey = true
+
+    init?(width: Int, height: Int, fps: Int, bitrate: Int, output: @escaping Output) {
+        self.output = output
+        let spec = [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true] as CFDictionary
+        var s: VTCompressionSession?
+        guard VTCompressionSessionCreate(allocator: nil, width: Int32(width), height: Int32(height), codecType: kCMVideoCodecType_H264,
+                                         encoderSpecification: spec, imageBufferAttributes: nil, compressedDataAllocator: nil,
+                                         outputCallback: nil, refcon: nil, compressionSessionOut: &s) == noErr, let session = s else { return nil }
+        self.session = session
+        let props: [CFString: CFTypeRef] = [
+            kVTCompressionPropertyKey_RealTime: kCFBooleanTrue,
+            kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
+            kVTCompressionPropertyKey_AllowFrameReordering: kCFBooleanFalse,
+            kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 2 as CFNumber,
+            kVTCompressionPropertyKey_ExpectedFrameRate: fps as CFNumber,
+            kVTCompressionPropertyKey_AverageBitRate: bitrate as CFNumber,
+            kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality: kCFBooleanTrue,
+            kVTCompressionPropertyKey_ColorPrimaries: kCVImageBufferColorPrimaries_ITU_R_709_2,
+            kVTCompressionPropertyKey_TransferFunction: kCVImageBufferTransferFunction_ITU_R_709_2,
+            kVTCompressionPropertyKey_YCbCrMatrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+        ]
+        for (key, value) in props { VTSessionSetProperty(session, key: key, value: value) }
+        VTCompressionSessionPrepareToEncodeFrames(session)
+    }
+
+    deinit {
+        VTCompressionSessionInvalidate(session)
+    }
+
+    func requestKeyframe() {
+        forceKey = true
+    }
+
+    func encode(_ pixels: CVPixelBuffer, pts: CMTime) {
+        var options: CFDictionary?
+        if forceKey {
+            forceKey = false
+            options = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
+        }
+        VTCompressionSessionEncodeFrame(session, imageBuffer: pixels, presentationTimeStamp: pts, duration: .invalid,
+                                        frameProperties: options, infoFlagsOut: nil) { [weak self] status, _, sample in
+            guard status == noErr, let sample = sample else { return }
+            self?.emit(sample)
+        }
+    }
+
+    private func emit(_ sample: CMSampleBuffer) {
+        guard let block = CMSampleBufferGetDataBuffer(sample) else { return }
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]]
+        let keyframe = !(attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
+        var au = Data()
+        if keyframe, let format = CMSampleBufferGetFormatDescription(sample) {
+            // SPS and PPS, so a phone that joins (or lost the picture) can start right here.
+            var count = 0
+            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: 0, parameterSetPointerOut: nil,
+                                                               parameterSetSizeOut: nil, parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil)
+            for i in 0..<count {
+                var set: UnsafePointer<UInt8>?
+                var size = 0
+                CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: i, parameterSetPointerOut: &set,
+                                                                   parameterSetSizeOut: &size, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
+                guard let set = set else { continue }
+                var length = UInt32(size).bigEndian
+                au.append(Data(bytes: &length, count: 4))
+                au.append(set, count: size)
+            }
+        }
+        var total = 0
+        var base: UnsafeMutablePointer<CChar>?
+        guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &total, dataPointerOut: &base) == noErr,
+              let base = base else { return }
+        au.append(Data(bytes: base, count: total)) // already length-prefixed NAL units
+        let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+        output(au, keyframe, Int64(CMTimeGetSeconds(pts) * 1_000_000))
+    }
+}
+
+/// Streams the main display to the phone as H.264 on file descriptor 3, one
+/// access unit per frame: a 4-byte big-endian length, then a flags byte
+/// (1 = keyframe), the capture time in µs (8 bytes, big-endian) and the NAL
+/// units. ScreenCaptureKit only hands over a frame when something on screen
+/// changed, so a still screen costs nothing.
+// `stream`/`starting`/`bounds` are only touched on the main thread; the
+// encoder and the last picture only on `queue`.
+final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    private var stream: SCStream?
+    private var starting = false
+    private let queue = DispatchQueue(label: "rackpad.screen", qos: .userInteractive)
+    private let out: FileHandle? = fcntl(3, F_GETFD) == -1 ? nil : FileHandle(fileDescriptor: 3, closeOnDealloc: false)
+    private var encoder: H264Encoder?
+    private var capturing: SCStream?
+    private var last: CVPixelBuffer?
+    private var lastAt: TimeInterval = 0
+    /// The streamed display, in global coordinates (where taps on the picture go).
+    private(set) var bounds = CGDisplayBounds(CGMainDisplayID())
+
+    func start(maxWidth: Int, fps: Int, bitrate: Int) {
+        guard let out = out, stream == nil, !starting else { return }
+        guard CGPreflightScreenCaptureAccess() else {
+            CGRequestScreenCaptureAccess() // the system's own prompt, once
+            emit(["ev": "screen", "on": false, "error": "permission"])
+            return
+        }
+        starting = true
+        let fps = min(max(fps, 1), 60)
+        Task {
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                let mainID = CGMainDisplayID()
+                guard let display = content.displays.first(where: { $0.displayID == mainID }) ?? content.displays.first else {
+                    throw NSError(domain: "Rackpad", code: 1, userInfo: [NSLocalizedDescriptionKey: "no display to stream"])
+                }
+                let screen = NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display.displayID }
+                let pixelsWide = Double(display.width) * Double(screen?.backingScaleFactor ?? 2)
+                let width = min(Double(max(maxWidth, 320)), pixelsWide)
+                let even = { (v: Double) in Int(v / 2) * 2 } // H.264 wants even sizes
+                let config = SCStreamConfiguration()
+                config.width = even(width)
+                config.height = even(width * Double(display.height) / Double(display.width))
+                config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+                config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange // what the encoder eats, no conversion
+                config.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
+                config.colorSpaceName = CGColorSpace.sRGB
+                config.showsCursor = true
+                config.queueDepth = 5
+                guard let encoder = H264Encoder(width: config.width, height: config.height, fps: fps, bitrate: bitrate, output: { au, key, pts in
+                    var length = UInt32(au.count + 9).bigEndian
+                    var frame = Data(bytes: &length, count: 4)
+                    frame.append(key ? 1 : 0)
+                    var time = pts.bigEndian
+                    frame.append(Data(bytes: &time, count: 8))
+                    frame.append(au)
+                    out.write(frame)
+                }) else {
+                    throw NSError(domain: "Rackpad", code: 2, userInfo: [NSLocalizedDescriptionKey: "the H.264 encoder didn't start"])
+                }
+                let s = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: config, delegate: self)
+                try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+                queue.sync {
+                    self.encoder = encoder
+                    self.capturing = s
+                    self.last = nil
+                }
+                try await s.startCapture()
+                let displayID = display.displayID
+                DispatchQueue.main.async {
+                    self.starting = false
+                    self.stream = s
+                    self.bounds = CGDisplayBounds(displayID)
+                }
+                emit(["ev": "screen", "on": true, "width": config.width, "height": config.height])
+            } catch {
+                DispatchQueue.main.async { self.starting = false }
+                self.queue.async { self.release() }
+                let declined = (error as NSError).code == -3801 // SCStreamError.userDeclined
+                emit(["ev": "screen", "on": false, "error": declined ? "permission" : error.localizedDescription])
+            }
+        }
+    }
+
+    func stop() {
+        guard let s = stream else { return }
+        stream = nil
+        s.stopCapture { _ in }
+        queue.async { self.release() }
+        emit(["ev": "screen", "on": false])
+    }
+
+    /// A phone joined or lost the picture. On a still screen there's no new
+    /// frame coming, so the last one goes out again as the keyframe.
+    func keyframe() {
+        queue.async {
+            guard let encoder = self.encoder else { return }
+            encoder.requestKeyframe()
+            if let last = self.last, now() - self.lastAt > 0.1 {
+                self.lastAt = now()
+                encoder.encode(last, pts: CMClockGetTime(CMClockGetHostTimeClock()))
+            }
+        }
+    }
+
+    private func release() {
+        encoder = nil
+        capturing = nil
+        last = nil
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        DispatchQueue.main.async { if self.stream === stream { self.stream = nil } }
+        queue.async { if self.capturing === stream { self.release() } }
+        emit(["ev": "screen", "on": false, "error": error.localizedDescription])
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, sample.isValid, stream === capturing, let encoder = encoder,
+              let info = (CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])?.first,
+              let raw = info[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
+              let pixels = sample.imageBuffer else { return }
+        last = pixels
+        lastAt = now()
+        encoder.encode(pixels, pts: sample.presentationTimeStamp)
+    }
+}
+
+// MARK: - Screen off
+
+/// While the phone streams, the Mac's screen can look switched off: the
+/// brightness goes to zero, but macOS keeps drawing (a display that really
+/// sleeps stops drawing, and the stream with it). The brightness comes back
+/// when the phone stops, when nothing has renewed the request for a while,
+/// and when the helper exits.
+final class ScreenOff {
+    private typealias GetBrightness = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
+    private typealias SetBrightness = @convention(c) (CGDirectDisplayID, Float) -> Int32
+    private var getBrightness: GetBrightness?
+    private var setBrightness: SetBrightness?
+    private var saved: Float?
+    private var awake: IOPMAssertionID = 0
+    private var renewed: TimeInterval = 0
+    private var timer: Timer?
+
+    init() {
+        // DisplayServices is how macOS itself sets the built-in display's brightness.
+        guard let lib = dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_NOW) else { return }
+        if let f = dlsym(lib, "DisplayServicesGetBrightness") { getBrightness = unsafeBitCast(f, to: GetBrightness.self) }
+        if let f = dlsym(lib, "DisplayServicesSetBrightness") { setBrightness = unsafeBitCast(f, to: SetBrightness.self) }
+    }
+
+    /// Turn it on, or renew it: it gives the screen back by itself after 15 s without renewal.
+    func on() {
+        renewed = now()
+        guard saved == nil, let get = getBrightness, let set = setBrightness else { return }
+        var level: Float = 0.5
+        guard get(CGMainDisplayID(), &level) == 0 else { return }
+        saved = level
+        _ = set(CGMainDisplayID(), 0)
+        IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                    "Rackpad streams the screen" as CFString, &awake)
+        let t = Timer(timeInterval: 5, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        tick()
+        emit(["ev": "screenOff", "on": true])
+    }
+
+    private func tick() {
+        if now() - renewed > 15 { off(); return }
+        // Counts as activity, so the screen saver and the auto-lock stay away while streaming.
+        var activity: IOPMAssertionID = 0
+        IOPMAssertionDeclareUserActivity("Rackpad streams the screen" as CFString, kIOPMUserActiveLocal, &activity)
+    }
+
+    func off() {
+        timer?.invalidate()
+        timer = nil
+        if awake != 0 {
+            IOPMAssertionRelease(awake)
+            awake = 0
+        }
+        guard let level = saved else { return }
+        saved = nil
+        _ = setBrightness?(CGMainDisplayID(), level)
+        emit(["ev": "screenOff", "on": false])
+    }
+}
+
+// MARK: - Command loop
+
+let input = Input()
+let beacon = Beacon()
+let ripples = Ripples()
+let watcher = AppWatcher()
+let streamer = ScreenStreamer()
+let screenOff = ScreenOff()
+var lastBeaconPoke: TimeInterval = 0
+
+func unit(_ v: Any?) -> Double { min(max(num(v), 0), 1) }
+
+func handle(_ cmd: [String: Any]) {
+    guard let op = cmd["op"] as? String else { return }
+    switch op {
+    case "move":
+        input.move(dx: num(cmd["dx"]), dy: num(cmd["dy"]))
+        let t = now()
+        if t - lastBeaconPoke > 0.05 {
+            lastBeaconPoke = t
+            DispatchQueue.main.async { beacon.poke() }
+        }
+    case "button":
+        let name = cmd["b"] as? String ?? "left"
+        let down = (cmd["down"] as? Bool) ?? true
+        input.button(name, down: down, clicks: Int(num(cmd["n"])))
+        if down { DispatchQueue.main.async { ripples.fire(secondary: name != "left") } }
+    case "scroll":
+        input.scroll(dx: int32(cmd["dx"]), dy: int32(cmd["dy"]))
+    case "key":
+        let code = CGKeyCode(max(0, min(127, num(cmd["code"]))))
+        input.key(code: code, char: cmd["char"] as? String, mods: cmd["mods"] as? [String] ?? [], times: Int(max(1, num(cmd["n"]))))
+    case "text":
+        if let s = cmd["s"] as? String { input.type(s) }
+    case "media":
+        if let k = cmd["k"] as? String { DispatchQueue.main.async { postMediaKey(k) } }
+    case "moveTo":
+        // x and y run 0…1 across the streamed display.
+        let b = streamer.bounds
+        input.moveTo(CGPoint(x: b.minX + unit(cmd["x"]) * (b.width - 1), y: b.minY + unit(cmd["y"]) * (b.height - 1)))
+        DispatchQueue.main.async { beacon.poke() }
+    case "screen":
+        let on = (cmd["on"] as? Bool) ?? false
+        let width = Int(num(cmd["maxWidth"])), fps = Int(num(cmd["fps"])), bitrate = Int(num(cmd["bitrate"]))
+        DispatchQueue.main.async { on ? streamer.start(maxWidth: width, fps: fps, bitrate: max(bitrate, 500_000)) : streamer.stop() }
+    case "keyframe":
+        streamer.keyframe()
+    case "screenOff":
+        let on = (cmd["on"] as? Bool) ?? false
+        DispatchQueue.main.async { on ? screenOff.on() : screenOff.off() }
+    case "missionControl":
+        DispatchQueue.main.async { openMissionControl() }
+    case "config":
+        DispatchQueue.main.async {
+            if let b = cmd["beacon"] as? Bool { beacon.enabled = b; if !b { beacon.hide() } }
+            if let r = cmd["ripples"] as? Bool { ripples.enabled = r }
+            if let c = cmd["color"] as? String {
+                beacon.color = parseColor(hex: c, fallback: beacon.color)
+                ripples.color = parseColor(hex: c, fallback: ripples.color)
+            }
+            if let c = cmd["color2"] as? String { ripples.color2 = parseColor(hex: c, fallback: ripples.color2) }
+        }
+    default:
+        break
+    }
+}
+
+signal(SIGPIPE, SIG_DFL)
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+
+// Never leave the screen dark: give the brightness back when told to quit.
+signal(SIGTERM, SIG_IGN)
+let quitSignal = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+quitSignal.setEventHandler {
+    screenOff.off()
+    exit(0)
+}
+quitSignal.resume()
+
+// Ask for Accessibility access (shows the system prompt the first time), then
+// keep checking until it's granted so the phone can say what's missing.
+let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+let trusted = AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
+emit(["ev": "ready", "trusted": trusted])
+if !trusted {
+    let timer = Timer(timeInterval: 2, repeats: true) { t in
+        if AXIsProcessTrusted() {
+            emit(["ev": "trusted", "value": true])
+            t.invalidate()
+        }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+}
+
+watcher.start()
+
+// Input commands are handled on their own thread, in order, so typing a long
+// dictated sentence never stalls the overlays' animation on the main thread.
+let reader = Thread {
+    while let line = readLine(strippingNewline: true) {
+        guard let data = line.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+        handle(obj)
+    }
+    // Node went away: so do we, giving the screen its brightness back first.
+    DispatchQueue.main.sync { screenOff.off() }
+    exit(0)
+}
+reader.qualityOfService = .userInteractive
+reader.start()
+
+app.run()

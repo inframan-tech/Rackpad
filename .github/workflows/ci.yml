@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Compile the native helper
+        run: swiftc -O -swift-version 5 -o rackpad-helper helper/RackpadHelper.swift
+      - name: Unit tests
+        run: npm test

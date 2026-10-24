@@ -1,0 +1,828 @@
+/* Rackpad — phone UI. A glass surface and one accent colour (--accent, set
+   from JS). Surfaces are sets of tokens on <html data-surface>. */
+
+:root,
+[data-surface="black"] {
+  --bg: #000000;
+  --glass: #0b0b0d;
+  --glass-sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0) 34%);
+  --edge: rgba(255, 255, 255, 0.075);
+  --hairline: rgba(255, 255, 255, 0.09);
+  --text: #f5f5f7;
+  --muted: #8e8e93;
+  --faint: #4a4a4f;
+  --fill: rgba(255, 255, 255, 0.07);
+  --fill-strong: rgba(255, 255, 255, 0.14);
+  --sheet: #1c1c1e;
+  --lift: 0 0 #0000;
+  --accent: #64d2ff;
+  --on-accent: #000000;
+  --ok: #30d158;
+  --wait: #ffd60a;
+  --bad: #ff453a;
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, "Segoe UI", Roboto, sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, "Segoe UI", Roboto, sans-serif;
+  --r-pad: 30px;
+  color-scheme: dark;
+}
+
+[data-surface="silver"] {
+  --bg: #dcdce1;
+  --glass: linear-gradient(180deg, #f7f7f9 0%, #ececf0 100%);
+  --glass-sheen: linear-gradient(180deg, rgba(255, 255, 255, 0.9) 0%, rgba(255, 255, 255, 0) 22%);
+  --edge: rgba(0, 0, 0, 0.07);
+  --hairline: rgba(0, 0, 0, 0.09);
+  --text: #1d1d1f;
+  --muted: #6e6e73;
+  --faint: #a1a1a6;
+  --fill: rgba(0, 0, 0, 0.055);
+  --fill-strong: rgba(0, 0, 0, 0.1);
+  --sheet: #f6f6f8;
+  --lift: 0 1px 1px rgba(0, 0, 0, 0.04), 0 10px 30px rgba(0, 0, 0, 0.07);
+  --on-accent: #ffffff;
+  color-scheme: light;
+}
+
+/* The phone's notch, rounded corners and home bar, in one place (so a test
+   can stand in for a real iPhone). */
+:root {
+  --safe-top: env(safe-area-inset-top);
+  --safe-right: env(safe-area-inset-right);
+  --safe-bottom: env(safe-area-inset-bottom);
+  --safe-left: env(safe-area-inset-left);
+}
+
+/* ── Base ─────────────────────────────────────────────────────────────── */
+
+* { box-sizing: border-box; }
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body { position: fixed; inset: 0; }
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 0.08s;
+}
+button:active,
+.pressed { transform: scale(0.96); }
+
+.ic { width: 24px; height: 24px; display: block; flex: none; }
+[data-icon] { display: inline-flex; align-items: center; justify-content: center; }
+[hidden] { display: none !important; }
+
+.app {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: var(--safe-top) var(--safe-right) 0 var(--safe-left);
+}
+
+.stage { flex: 1; position: relative; min-height: 0; }
+
+.view {
+  position: absolute;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+}
+.view.active { display: flex; animation: appear 0.2s ease-out; }
+@keyframes appear { from { opacity: 0; } }
+
+/* ── Trackpad ─────────────────────────────────────────────────────────── */
+
+/* The whole view takes touches; the glass you see sits inside it. */
+.pad { position: absolute; inset: 0; touch-action: none; }
+
+.glass {
+  position: absolute;
+  inset: 6px 10px 0;
+  border-radius: var(--r-pad);
+  background: var(--glass-sheen), var(--glass);
+  box-shadow: inset 0 0 0 1px var(--edge), var(--lift);
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* A sweep of light across the glass when it wakes up. */
+.sheen {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 30%, rgba(255, 255, 255, 0.075) 50%, transparent 70%);
+  transform: translateX(-110%);
+}
+[data-surface="silver"] .sheen { background: linear-gradient(100deg, transparent 30%, rgba(255, 255, 255, 0.85) 50%, transparent 70%); }
+.glass.wake .sheen { animation: sweep 1.2s cubic-bezier(0.3, 0.1, 0.2, 1); }
+@keyframes sweep { to { transform: translateX(110%); } }
+
+/* Which Mac this is, quietly in the middle; it steps aside while you use it. */
+.presence {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  padding: 0 44px;
+  text-align: center;
+  transition: opacity 0.6s;
+}
+.presence.away { opacity: 0; transition-duration: 0.18s; }
+.presence .line { display: flex; align-items: center; gap: 8px; max-width: 100%; }
+.presence .dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--faint); }
+.presence[data-level="ok"] .dot { background: var(--ok); }
+.presence[data-level="wait"] .dot { background: var(--wait); animation: blink 1.2s infinite; }
+.presence[data-level="bad"] .dot { background: var(--bad); }
+.mac {
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.note { max-width: 270px; font-size: 13px; line-height: 1.4; color: var(--faint); }
+.note:empty { display: none; }
+@keyframes blink { 50% { opacity: 0.3; } }
+
+/* The thumb's scroll strip, along one edge of the glass. */
+.strip {
+  position: absolute;
+  top: 6px;
+  bottom: 0;
+  right: 10px;
+  z-index: 1;
+  width: 46px;
+  border-left: 1px solid var(--hairline);
+  border-radius: 0 var(--r-pad) var(--r-pad) 0;
+  touch-action: none;
+}
+.strip::before {
+  content: "";
+  position: absolute;
+  inset: 28px 15px;
+  background: repeating-linear-gradient(180deg, var(--hairline) 0 1px, transparent 1px 12px);
+  -webkit-mask: linear-gradient(180deg, transparent, #000 25%, #000 75%, transparent);
+  mask: linear-gradient(180deg, transparent, #000 25%, #000 75%, transparent);
+}
+.strip.active::before { background: repeating-linear-gradient(180deg, var(--accent) 0 1px, transparent 1px 12px); }
+.app[data-strip="left"] .strip {
+  right: auto;
+  left: 10px;
+  border-left: 0;
+  border-right: 1px solid var(--hairline);
+  border-radius: var(--r-pad) 0 0 var(--r-pad);
+}
+.app[data-strip="off"] .strip { display: none; }
+
+/* ── Sideways: the whole phone is the trackpad ────────────────────────── */
+
+/* The empty space beside the glass, where the camera sits, holds the scroll
+   strip and the keyboard key: --col is that side, --far the other one. */
+body.magic .app {
+  padding: 0;
+  --col: max(54px, var(--safe-right));
+  --far: max(10px, var(--safe-left));
+}
+body.magic .app[data-strip="left"] {
+  --col: max(54px, var(--safe-left));
+  --far: max(10px, var(--safe-right));
+}
+body.magic .dock { display: none; }
+body.magic .glass {
+  inset: 10px var(--col) max(10px, var(--safe-bottom)) var(--far);
+  border-radius: 34px;
+}
+body.magic .app[data-strip="left"] .glass { inset: 10px var(--far) max(10px, var(--safe-bottom)) var(--col); }
+
+body.magic .strip,
+body.magic .app[data-strip="left"] .strip {
+  top: 10px;
+  bottom: calc(max(10px, var(--safe-bottom)) + 56px);
+  right: 0;
+  left: auto;
+  width: var(--col);
+  border: 0;
+  border-radius: 0;
+}
+body.magic .app[data-strip="left"] .strip { right: auto; left: 0; }
+
+.side-key { display: none; }
+body.magic .side-key {
+  display: grid;
+  place-items: center;
+  position: absolute;
+  right: 0;
+  bottom: max(10px, var(--safe-bottom));
+  z-index: 2;
+  width: var(--col);
+  height: 52px;
+  color: var(--faint);
+  transition: color 0.2s;
+}
+body.magic .app[data-strip="left"] .side-key { right: auto; left: 0; }
+body.magic .side-key:active { transform: none; color: var(--muted); }
+body.magic .side-key[aria-pressed="true"] { color: var(--text); }
+body.magic .side-key[aria-pressed="true"]::after {
+  content: "";
+  position: absolute;
+  bottom: 4px;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  margin-left: -2px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+/* Typing sideways: text on top, a strip of trackpad, then the keys right
+   above the (wide) on-screen keyboard. */
+body.magic .view.active[data-view="keys"] {
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-areas: "compose compose" "mini mini" "mods nav";
+  gap: 6px 8px;
+  padding: 6px var(--col) 8px var(--far);
+}
+body.magic .app[data-strip="left"] .view.active[data-view="keys"] { padding: 6px var(--far) 8px var(--col); }
+body.magic .compose { grid-area: compose; }
+body.magic .mini { grid-area: mini; min-height: 0; }
+body.magic .keyrow.mods { grid-area: mods; }
+body.magic .keyrow.nav { grid-area: nav; }
+body.magic #type-field { height: 46px; min-height: 0; max-height: none; font-size: 18px; padding: 11px 110px 11px 8px; }
+body.magic .keyrow button { height: 38px; }
+body.magic.kb .keyrow button { height: 34px; }
+
+/* ── Dock ─────────────────────────────────────────────────────────────── */
+
+.dock {
+  flex: none;
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  height: calc(56px + var(--safe-bottom));
+  padding: 0 8px var(--safe-bottom);
+}
+.dock button {
+  position: relative;
+  display: grid;
+  place-items: center;
+  color: var(--faint);
+  transition: color 0.2s;
+}
+.dock button:active { transform: none; color: var(--muted); }
+.dock button[aria-selected="true"] { color: var(--text); }
+.dock button[aria-selected="true"]::after {
+  content: "";
+  position: absolute;
+  bottom: 6px;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  margin-left: -2px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.app-ic {
+  width: 25px;
+  height: 25px;
+  border-radius: 6px;
+  filter: grayscale(1);
+  opacity: 0.45;
+  transition: filter 0.2s, opacity 0.2s;
+}
+.dock button[aria-selected="true"] .app-ic { filter: none; opacity: 1; }
+
+/* ── Ping ─────────────────────────────────────────────────────────────── */
+
+/* Round trip to the Mac, always in view: under the dock beside the home bar,
+   or sideways in the empty space across from the strip, above the notch. */
+.ping {
+  position: absolute;
+  right: 38px;
+  bottom: max(4px, calc(var(--safe-bottom) - 26px));
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--faint);
+  white-space: nowrap;
+  pointer-events: none;
+}
+.ping .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--faint); transition: background 0.3s; }
+.ping[data-level="ok"] .dot { background: var(--ok); }
+.ping[data-level="wait"] .dot { background: var(--wait); }
+.ping[data-level="bad"] .dot { background: var(--bad); }
+body.kb .ping { display: none; }
+body.magic .ping {
+  top: 42px;
+  bottom: auto;
+  left: max(0px, calc((var(--far) - 44px) / 2));
+  right: auto;
+  width: 44px;
+  flex-direction: column;
+  gap: 4px;
+}
+body.magic .app[data-strip="left"] .ping { left: auto; right: max(0px, calc((var(--far) - 44px) / 2)); }
+
+/* ── Keys ─────────────────────────────────────────────────────────────── */
+
+.view[data-view="keys"] { gap: 8px; padding: 6px 10px 8px; }
+
+.compose { position: relative; flex: none; }
+#type-field {
+  display: block;
+  width: 100%;
+  min-height: 92px;
+  max-height: 30vh;
+  resize: none;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  caret-color: var(--accent);
+  font: 400 21px/1.35 var(--font-display);
+  letter-spacing: -0.01em;
+  padding: 12px 104px 10px 8px;
+  -webkit-user-select: text;
+  user-select: text;
+}
+#type-field::placeholder { color: var(--faint); }
+.compose-tools { position: absolute; top: 10px; right: 2px; display: flex; align-items: center; gap: 6px; }
+.live {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 11px;
+  border-radius: 999px;
+  background: var(--fill);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.live .led { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); transition: background 0.2s, box-shadow 0.2s; }
+.live[aria-pressed="true"] { color: var(--text); }
+.live[aria-pressed="true"] .led { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+.ghost,
+.send {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--fill);
+  color: var(--muted);
+}
+.send { background: var(--accent); color: var(--on-accent); }
+.ghost .ic,
+.send .ic { width: 16px; height: 16px; }
+
+.mini { position: relative; flex: 1; min-height: 56px; touch-action: none; }
+.mini .glass { inset: 0; border-radius: 22px; }
+
+.keyrow { flex: none; display: grid; gap: 6px; }
+.keyrow.mods { grid-template-columns: repeat(4, 1fr); }
+.keyrow.nav { grid-template-columns: repeat(8, 1fr); }
+.keyrow button {
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border-radius: 11px;
+  background: var(--fill);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 500;
+  transition: transform 0.08s, background 0.15s, color 0.15s;
+}
+.keyrow.mods button { font-size: 19px; font-weight: 400; }
+.keyrow .ic { width: 19px; height: 19px; }
+.keyrow button:active,
+.keyrow button.pressed { background: var(--fill-strong); }
+.keyrow button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
+
+/* While the on-screen keyboard is up, give its space to the text and keys. */
+body.kb .dock { display: none; }
+body.kb #type-field { min-height: 60px; font-size: 19px; }
+body.kb .keyrow button { height: 38px; }
+
+/* ── Remote ───────────────────────────────────────────────────────────── */
+
+.view[data-view="remote"] { align-items: center; justify-content: center; gap: 30px; padding: 0 20px 12px; }
+
+.readout { width: min(72vw, 280px); text-align: center; }
+.vol {
+  display: block;
+  font: 200 68px/1 var(--font-display);
+  letter-spacing: -0.04em;
+  font-variant-numeric: tabular-nums;
+}
+.readout.muted .vol { color: var(--faint); }
+.vol-bar { height: 3px; margin-top: 16px; border-radius: 2px; background: var(--fill-strong); overflow: hidden; }
+.vol-bar div { width: 0%; height: 100%; border-radius: 2px; background: var(--text); transition: width 0.18s; }
+.readout.muted .vol-bar div { opacity: 0.3; }
+
+.wheel {
+  position: relative;
+  flex: none;
+  width: min(80vw, 330px, 48vh);
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: var(--glass-sheen), var(--glass);
+  box-shadow: inset 0 0 0 1px var(--edge), var(--lift);
+  touch-action: none;
+}
+/* Sixteen faint notches, one per volume step. */
+.wheel::before {
+  content: "";
+  position: absolute;
+  inset: 5%;
+  border-radius: 50%;
+  background: repeating-conic-gradient(from -1deg, var(--hairline) 0deg 2deg, transparent 2deg 22.5deg);
+  -webkit-mask: radial-gradient(circle closest-side, transparent calc(100% - 9px), #000 calc(100% - 8px));
+  mask: radial-gradient(circle closest-side, transparent calc(100% - 9px), #000 calc(100% - 8px));
+  pointer-events: none;
+}
+.wl {
+  position: absolute;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  transition: color 0.15s;
+  pointer-events: none;
+}
+.wl .ic { width: 20px; height: 20px; }
+.wl.top { top: 11%; left: 50%; transform: translateX(-50%); padding-left: 0.16em; }
+.wl.bottom { bottom: 11%; left: 50%; transform: translateX(-50%); }
+.wl.left { left: 10%; top: 50%; transform: translateY(-50%); }
+.wl.right { right: 10%; top: 50%; transform: translateY(-50%); }
+.wl.flash { color: var(--accent); }
+.wheel-center {
+  position: absolute;
+  inset: 34%;
+  border-radius: 50%;
+  background: var(--fill);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  pointer-events: none;
+  transition: transform 0.08s, background 0.15s;
+}
+.wheel-center.pressed { transform: scale(0.96); background: var(--fill-strong); }
+.wheel-dot {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  margin: -5px 0 0 -5px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 12px var(--accent);
+  opacity: 0;
+  transition: opacity 0.25s;
+  pointer-events: none;
+}
+.wheel.turning .wheel-dot { opacity: 1; }
+
+/* ── Screen ───────────────────────────────────────────────────────────── */
+
+.view[data-view="screen"] { padding: 6px 10px 0; }
+.screen {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  border-radius: 18px;
+  overflow: hidden;
+  background: var(--glass);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  touch-action: none;
+}
+#screen-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+  visibility: hidden;
+}
+#screen-video.playing { visibility: visible; }
+.screen-msg {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px 28px;
+  text-align: center;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.screen-msg.quiet { color: var(--faint); }
+.screen-fail {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px 28px;
+  text-align: center;
+}
+.screen-fail[hidden] { display: none; }
+.screen-fail b { font-size: 17px; line-height: 1.35; font-weight: 600; letter-spacing: -0.01em; color: var(--text); max-width: 22em; }
+.screen-fail small { font-size: 13px; line-height: 1.45; color: var(--muted); max-width: 26em; }
+.screen-fail .pill { margin-top: 6px; }
+.screen-off {
+  position: absolute;
+  right: 18px;
+  bottom: 10px;
+  z-index: 2;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.55);
+  color: #d1d1d6;
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+}
+.screen-off .ic { width: 19px; height: 19px; }
+.screen-off[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
+body.magic .view[data-view="screen"] { padding: 6px var(--col) max(6px, var(--safe-bottom)) var(--far); }
+body.magic .app[data-strip="left"] .view[data-view="screen"] { padding: 6px var(--far) max(6px, var(--safe-bottom)) var(--col); }
+body.magic .screen-off { right: calc(var(--col) + 10px); bottom: max(12px, calc(var(--safe-bottom) + 6px)); }
+body.magic .app[data-strip="left"] .screen-off { right: calc(var(--far) + 10px); }
+
+/* ── App controls ─────────────────────────────────────────────────────── */
+
+.view[data-view="app"] { padding: 6px 14px 12px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+.smart-panel { display: flex; flex-direction: column; gap: 16px; min-height: 100%; }
+.sp-head { display: flex; align-items: center; gap: 12px; padding: 8px 2px 0; }
+.sp-head img { width: 40px; height: 40px; border-radius: 9px; }
+.sp-app { font: 600 22px/1.15 var(--font-display); letter-spacing: -0.02em; }
+.sp-kind { margin-top: 2px; font-size: 13px; color: var(--muted); }
+
+.tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  min-height: 84px;
+  padding: 10px 6px;
+  border-radius: 18px;
+  background: var(--fill);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.2;
+  text-align: center;
+  color: var(--muted);
+  transition: transform 0.08s, background 0.15s;
+}
+.tile .ic { color: var(--text); }
+.tile:active,
+.tile.flash { background: var(--fill-strong); }
+
+.hero-btn {
+  flex: none;
+  align-self: center;
+  width: min(58vw, 38vh, 230px);
+  aspect-ratio: 1;
+  margin: 10px 0 6px;
+  border-radius: 50%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: var(--fill);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  font-size: 17px;
+  font-weight: 600;
+  transition: transform 0.08s, background 0.15s, color 0.15s;
+}
+.hero-btn .ic { width: 50px; height: 50px; stroke-width: 1.5; }
+.hero-btn small { font-size: 12px; font-weight: 400; color: var(--muted); }
+.hero-btn.flash { background: var(--accent); color: var(--on-accent); }
+.hero-btn.flash small { color: inherit; }
+
+.slides { flex: 1; display: flex; flex-direction: column; gap: 10px; }
+.timer { display: flex; align-items: center; justify-content: space-between; padding: 6px 4px; }
+.t-elapsed { font: 200 46px/1 var(--font-display); letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
+.t-clock { margin-top: 4px; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.t-btns { display: flex; gap: 6px; }
+.pill { height: 32px; padding: 0 14px; border-radius: 999px; background: var(--fill); font-size: 13px; font-weight: 600; }
+.next-btn {
+  flex: 1;
+  min-height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border-radius: 26px;
+  background: var(--fill);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  font: 600 26px var(--font-display);
+  letter-spacing: -0.02em;
+  transition: transform 0.08s, background 0.15s, color 0.15s;
+}
+.next-btn .ic { width: 34px; height: 34px; }
+.next-btn.flash { background: var(--accent); color: var(--on-accent); }
+.slides-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.slides-row .tile { min-height: 72px; }
+
+/* ── Touch glow ───────────────────────────────────────────────────────── */
+
+.glow { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; }
+
+/* ── Sheets ───────────────────────────────────────────────────────────── */
+
+.backdrop { position: fixed; inset: 0; z-index: 20; background: rgba(0, 0, 0, 0.42); animation: fade 0.2s; }
+@keyframes fade { from { opacity: 0; } }
+
+.sheet {
+  position: fixed;
+  left: 8px;
+  right: 8px;
+  bottom: max(8px, var(--safe-bottom));
+  z-index: 21;
+  max-height: calc(100% - var(--safe-top) - 24px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 6px 16px 14px;
+  border-radius: 30px;
+  background: var(--sheet);
+  box-shadow: inset 0 0 0 1px var(--edge), 0 20px 60px rgba(0, 0, 0, 0.35);
+  animation: rise 0.32s cubic-bezier(0.2, 0.9, 0.25, 1);
+}
+@keyframes rise { from { transform: translateY(110%); } }
+body.magic .sheet { left: 0; right: 0; width: min(520px, calc(100% - 16px)); margin: 0 auto; }
+
+.sheet-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 2px 12px; }
+.sheet h2 { margin: 0; font: 600 20px var(--font-display); letter-spacing: -0.02em; }
+.done { padding: 6px 2px; font-size: 16px; font-weight: 600; color: var(--accent); }
+
+.group { margin-bottom: 12px; border-radius: 16px; background: var(--fill); overflow: hidden; }
+.group > * + * { border-top: 1px solid var(--hairline); }
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 48px;
+  padding: 8px 14px;
+  font-size: 15px;
+}
+
+.slider { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px 12px; padding: 12px 14px; font-size: 15px; }
+.slider output { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.slider input { grid-column: 1 / -1; width: 100%; margin: 0; accent-color: var(--accent); }
+
+.sw input {
+  -webkit-appearance: none;
+  appearance: none;
+  position: relative;
+  flex: none;
+  width: 51px;
+  height: 31px;
+  margin: 0;
+  border-radius: 999px;
+  background: var(--fill-strong);
+  transition: background 0.2s;
+  cursor: pointer;
+}
+.sw input::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 27px;
+  height: 27px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+  transition: transform 0.22s cubic-bezier(0.3, 0.7, 0.4, 1);
+}
+.sw input:checked { background: var(--accent); }
+.sw input:checked::before { transform: translateX(20px); }
+
+.seg { display: flex; padding: 2px; border-radius: 9px; background: var(--fill); }
+.seg button { height: 28px; padding: 0 12px; border-radius: 7px; font-size: 13px; font-weight: 500; color: var(--muted); }
+.seg button:active { transform: none; }
+.seg button[aria-pressed="true"] { background: var(--fill-strong); color: var(--text); }
+
+.accents { display: flex; gap: 9px; }
+.accent-dot { position: relative; width: 24px; height: 24px; border-radius: 50%; background: var(--c); }
+.accent-dot[aria-pressed="true"]::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px var(--c);
+}
+
+.gestures summary { list-style: none; cursor: pointer; }
+.gestures summary::-webkit-details-marker { display: none; }
+.gestures summary .ic { width: 16px; height: 16px; color: var(--faint); transition: transform 0.2s; }
+.gestures[open] summary .ic { transform: rotate(90deg); }
+.gestures dl { display: grid; grid-template-columns: auto 1fr; gap: 9px 14px; margin: 0; padding: 12px 14px 14px; font-size: 13px; }
+.gestures dd { margin: 0; text-align: right; color: var(--muted); }
+
+.about { margin: 4px 0 2px; text-align: center; font-size: 12px; color: var(--faint); }
+
+.row.link { width: 100%; text-align: left; }
+.row.link:active { transform: none; background: var(--fill-strong); }
+.row-value { display: flex; align-items: center; gap: 4px; color: var(--muted); }
+.row-value .ic { width: 16px; height: 16px; color: var(--faint); }
+.row-value.on { color: var(--ok); }
+
+.lead { margin: 0 2px 14px; font-size: 14px; line-height: 1.45; color: var(--muted); }
+.steps { margin: 0 0 14px; padding: 0; list-style: none; counter-reset: step; border-radius: 16px; background: var(--fill); overflow: hidden; }
+.steps li { counter-increment: step; display: flex; align-items: center; gap: 12px; padding: 12px 14px; font-size: 15px; }
+.steps li + li { border-top: 1px solid var(--hairline); }
+.steps li::before {
+  content: counter(step);
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--fill-strong);
+  font-size: 13px;
+  font-weight: 600;
+}
+.steps li > div { flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.steps small { font-size: 12.5px; line-height: 1.4; color: var(--muted); }
+.steps .pill { flex: none; display: grid; place-items: center; text-decoration: none; color: var(--text); }
+.ca-name { color: var(--text); }
+.cta:disabled { opacity: 0.45; }
+
+#install { padding: 26px 22px 18px; text-align: center; }
+.install-art { display: block; margin: 0 auto; border-radius: 15px; }
+#install h2 { margin: 14px 0 8px; }
+#install p { max-width: 300px; margin: 0 auto 18px; font-size: 15px; line-height: 1.45; color: var(--muted); }
+#install b { font-weight: 600; color: var(--text); }
+.inline-ic { vertical-align: -4px; color: var(--accent); }
+.inline-ic .ic { width: 20px; height: 20px; }
+.cta { width: 100%; height: 50px; border-radius: 16px; background: var(--accent); color: var(--on-accent); font-size: 16px; font-weight: 600; }
+
+/* ── Pairing screen ───────────────────────────────────────────────────── */
+
+.pairing {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 32px;
+  text-align: center;
+  background: var(--bg);
+}
+.pairing img { border-radius: 16px; }
+.pairing h1 { margin: 4px 0 0; font: 600 28px var(--font-display); letter-spacing: -0.02em; }
+.pairing p { max-width: 280px; margin: 0; font-size: 15px; line-height: 1.5; color: var(--muted); }
+.pairing .scan { display: flex; align-items: center; justify-content: center; gap: 8px; max-width: 300px; margin-top: 10px; cursor: pointer; }
+.pairing .scan .ic { width: 22px; height: 22px; }
+.pair-hint { max-width: 280px; margin: 4px 0 0; font-size: 13px; line-height: 1.5; color: var(--faint); }
+.pair-hint code { padding: 2px 6px; border-radius: 6px; background: var(--fill); color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+/* Still focusable and clickable through its label, unlike display: none. */
+.offscreen { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
