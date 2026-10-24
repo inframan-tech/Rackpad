@@ -30,9 +30,10 @@ const MIME = {
 };
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
-const MAX_STREAM_WIDTH = 1600; // px across: sharp on a phone, light on Wi-Fi
-const STREAM_FPS = 30;
-const STREAM_QUALITY = 0.6;
+const MAX_STREAM_WIDTH = 1920; // px across: sharp on any phone
+const STREAM_FPS = 60;
+const STREAM_BITRATE = 8_000_000; // bits/s at most, while things move; a still screen sends nothing
+const KEYFRAME_GAP_MS = 250; // phones asking for keyframes at once get one
 
 // Third-party browser code, served straight from node_modules.
 const VENDOR = new Map([['/vendor/jsQR.js', createRequire(import.meta.url).resolve('jsqr')]]);
@@ -63,44 +64,69 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
   backend.on('status', (status) => broadcast({ t: 'status', backend: status }));
 
   // ── Screen streaming ──────────────────────────────────────────────────
-  // A phone watching the screen gets the newest frame as soon as it has shown
-  // the last one: there's never a queue, so the picture is never behind.
+  // WebRTC only (see rtc.js): each watching phone gets its own video link,
+  // all fed by the one hardware encoder. libdatachannel is loaded the first
+  // time a phone asks, so a Mac without it still runs everything else.
   let streaming = null; // what the helper streams at: { maxWidth }
-  let lastFrame = null;
   let darkened = false;
+  let rtc = null;
+  let lastKeyframe = 0;
   const watching = () => [...clients.entries()].filter(([, c]) => c.screen.on);
+  const loadRtc = () => (rtc ??= import('./rtc.js'));
 
   function updateStream() {
     const viewers = watching();
     if (!viewers.length) {
       if (streaming) backend.send({ op: 'screen', on: false });
       streaming = null;
-      lastFrame = null;
       return;
     }
     const maxWidth = Math.min(MAX_STREAM_WIDTH, Math.max(...viewers.map(([, c]) => c.screen.maxWidth)));
     if (streaming?.maxWidth === maxWidth) return;
     if (streaming) backend.send({ op: 'screen', on: false }); // start again at the new size
-    backend.send({ op: 'screen', on: true, maxWidth, fps: STREAM_FPS, quality: STREAM_QUALITY });
+    backend.send({ op: 'screen', on: true, maxWidth, fps: STREAM_FPS, bitrate: STREAM_BITRATE });
     streaming = { maxWidth };
   }
 
-  function deliver(ws, c, jpeg) {
-    const s = c.screen;
-    const showing = s.waiting && performance.now() - s.sentAt < 2000; // no answer in 2 s: send anyway
-    if (showing || ws.readyState !== ws.OPEN || ws.bufferedAmount > 2_000_000) {
-      s.pending = jpeg;
-      return;
-    }
-    s.pending = null;
-    s.waiting = true;
-    s.sentAt = performance.now();
-    ws.send(jpeg, { binary: true });
+  function keyframe() {
+    const now = performance.now();
+    if (now - lastKeyframe < KEYFRAME_GAP_MS) return;
+    lastKeyframe = now;
+    backend.send({ op: 'keyframe' });
   }
 
-  backend.on('frame', (jpeg) => {
-    lastFrame = jpeg;
-    for (const [ws, c] of watching()) deliver(ws, c, jpeg);
+  async function openPeer(ws, c) {
+    closePeer(c);
+    const tell = (msg) => ws.readyState === ws.OPEN && ws.send(JSON.stringify(msg));
+    let mod;
+    try {
+      mod = await loadRtc();
+    } catch (err) {
+      log(`WebRTC isn't available: ${err.message}`);
+      tell({ t: 'rtc', error: `WebRTC didn't load on the Mac (${err.message.split('\n')[0]})` });
+      return;
+    }
+    if (!c.screen.on || clients.get(ws) !== c) return; // stopped watching meanwhile
+    closePeer(c); // a newer request may have opened one meanwhile; the newest wins
+    try {
+      c.screen.peer = new mod.ScreenPeer({
+        signal: tell,
+        keyframe,
+        state: (s) => s === 'connected' && log(`🖥  ${c.name} watches the screen over WebRTC`),
+        log: backend.verbose ? log : () => {},
+      });
+    } catch (err) {
+      tell({ t: 'rtc', error: `WebRTC didn't start on the Mac (${err.message})` });
+    }
+  }
+
+  function closePeer(c) {
+    c.screen.peer?.close();
+    c.screen.peer = null;
+  }
+
+  backend.on('frame', (frame) => {
+    for (const [, c] of watching()) c.screen.peer?.send(frame);
   });
   backend.on('screen', (state) => {
     const data = JSON.stringify({ t: 'screen', ...state });
@@ -243,7 +269,7 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
       onVolume: (v) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ t: 'volume', ...v })),
       onStats: backend.verbose ? (st) => log(`glide: ${st.moves} moves in 3s, ${st.late} late, playing ${st.buffer} ms behind`) : null,
     });
-    const client = { session, name, screen: { on: false, maxWidth: 1280, waiting: false, pending: null, sentAt: 0 }, screenOff: false };
+    const client = { session, name, screen: { on: false, maxWidth: 1280, peer: null }, screenOff: false };
     clients.set(ws, client);
     log(`📱 ${name} connected (${req.socket.remoteAddress}${platformOf(req.headers['user-agent'])})`);
 
@@ -267,16 +293,14 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
       if (msg?.t === 'screen') {
         client.screen.on = msg.on === true;
         client.screen.maxWidth = Math.round(Math.min(MAX_STREAM_WIDTH, Math.max(320, Number(msg.maxWidth) || 1280)));
-        client.screen.waiting = false;
-        client.screen.pending = null;
+        if (client.screen.on) openPeer(ws, client);
+        else closePeer(client);
         updateStream();
         updateScreenOff();
-        if (client.screen.on && lastFrame) deliver(ws, client, lastFrame);
         return;
       }
-      if (msg?.t === 'frameAck') {
-        client.screen.waiting = false;
-        if (client.screen.on && client.screen.pending) deliver(ws, client, client.screen.pending);
+      if (msg?.t === 'rtc') {
+        client.screen.peer?.remote(msg);
         return;
       }
       if (msg?.t === 'screenOff') {
@@ -292,6 +316,7 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
     });
     ws.on('close', () => {
       session.dispose();
+      closePeer(client);
       clients.delete(ws);
       updateStream();
       updateScreenOff();
@@ -338,7 +363,10 @@ export function createRackpadServer({ backend, token, macName, version, pairing,
     close() {
       clearInterval(heartbeat);
       clearInterval(renewScreenOff);
-      for (const ws of clients.keys()) ws.terminate();
+      for (const [ws, c] of clients) {
+        closePeer(c);
+        ws.terminate();
+      }
       wss.close();
       const closing = [server, secureServer].filter((srv) => srv?.listening).map((srv) => new Promise((resolve) => srv.close(() => resolve())));
       return Promise.all(closing);

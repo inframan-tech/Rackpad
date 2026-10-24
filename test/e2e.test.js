@@ -257,17 +257,18 @@ test('smart layout follows the front app and its buttons work', { skip }, async 
   await page.waitForFunction(() => document.querySelector('section[data-view="keys"]').classList.contains('active'));
 });
 
-test('the Screen view streams the Mac, and a tap clicks right there', { skip }, async () => {
+test('the Screen view streams the Mac over WebRTC, and a tap clicks right there', { skip }, async () => {
   await show('screen');
   await waitFor(() => opsOf('screen').some((o) => o.on === true));
-  await page.waitForFunction(() => document.querySelector('#screen-img').naturalWidth > 0);
-  // Frames keep coming: each one shown is acknowledged, and the next arrives.
-  const first = await page.getAttribute('#screen-img', 'src');
-  await page.waitForFunction((src) => document.querySelector('#screen-img').getAttribute('src') !== src, first);
+  // H.264 over WebRTC from the dry-run clip: the picture shows and keeps moving.
+  await page.waitForFunction(() => document.querySelector('#screen-video.playing')?.videoWidth > 0, null, { timeout: 8000 });
+  assert.ok(opsOf('keyframe').length >= 1, 'the phone starts on a fresh keyframe');
+  const t0 = await page.evaluate(() => document.querySelector('#screen-video').currentTime);
+  await page.waitForFunction((t) => document.querySelector('#screen-video').currentTime > t + 0.3, t0);
 
   // Tap at 25% across and halfway down the Mac's screen, wherever the picture sits on the phone.
-  const box = await page.locator('#screen-img').boundingBox();
-  const [w, h] = await page.evaluate(() => [document.querySelector('#screen-img').naturalWidth, document.querySelector('#screen-img').naturalHeight]);
+  const box = await page.locator('#screen-video').boundingBox();
+  const [w, h] = await page.evaluate(() => [document.querySelector('#screen-video').videoWidth, document.querySelector('#screen-video').videoHeight]);
   const scale = Math.min(box.width / w, box.height / h);
   const x = box.x + (box.width - w * scale) / 2 + 0.25 * w * scale;
   const y = box.y + (box.height - h * scale) / 2 + 0.5 * h * scale;
@@ -285,6 +286,24 @@ test('the Screen view streams the Mac, and a tap clicks right there', { skip }, 
   await page.waitForFunction(() => document.querySelector('#screen-off').getAttribute('aria-pressed') === 'true');
   await show('pad');
   await waitFor(() => opsOf('screen').some((o) => o.on === false) && opsOf('screenOff').some((o) => o.on === false));
+});
+
+test('without WebRTC there is no picture, and it says so: no JPEG', { skip }, async () => {
+  await page.evaluate(() => {
+    window.realPeerConnection = window.RTCPeerConnection;
+    window.RTCPeerConnection = undefined;
+  });
+  await show('screen');
+  await page.waitForFunction(() => !document.querySelector('#screen-fail').hidden);
+  assert.match(await page.textContent('#screen-fail'), /not going to stream over JPEG — get the hell out\..*no WebRTC/s);
+  await waitFor(() => opsOf('screen').at(-1)?.on === false);
+
+  // With WebRTC back, Try again brings the picture.
+  await page.evaluate(() => (window.RTCPeerConnection = window.realPeerConnection));
+  await page.locator('#screen-retry').click();
+  await page.waitForFunction(() => document.querySelector('#screen-video.playing')?.videoWidth > 0, null, { timeout: 8000 });
+  assert.equal(await page.isHidden('#screen-fail'), true);
+  await show('pad');
 });
 
 test('sideways, the whole phone is the trackpad', { skip }, async () => {

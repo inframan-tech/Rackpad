@@ -333,7 +333,7 @@ test("spots the AirDrop radio that makes Wi-Fi hitch", () => {
 // ── The streamed screen ───────────────────────────────────────────────────
 
 test('screen frames come through whole, however the pipe splits them', () => {
-  const frames = [Buffer.from('first jpeg'), Buffer.alloc(70000, 7), Buffer.from('third')];
+  const frames = [Buffer.from('first frame'), Buffer.alloc(70000, 7), Buffer.from('third')];
   const wire = Buffer.concat(frames.flatMap((f) => [Buffer.from([0, 0, 0, 0].map((_, i) => (f.length >>> (24 - 8 * i)) & 255)), f]));
   for (const size of [1, 3, 4096, wire.length]) {
     const got = [];

@@ -199,7 +199,6 @@ function start() {
   });
   const wheel = new WheelView({ root: $('[data-view="remote"]'), send, feel });
   const screenView = new ScreenView({ root: $('[data-view="screen"]'), send, feel });
-  conn.addEventListener('frame', (e) => screenView.frame(e.detail));
   // The stream runs only while the Screen view is on screen.
   const watchScreen = (force = false) => screenView.watch(app.dataset.current === 'screen' && document.visibilityState === 'visible', force);
   document.addEventListener('visibilitychange', () => watchScreen());
@@ -551,6 +550,9 @@ function start() {
         break;
       case 'screen':
         screenView.status(msg);
+        break;
+      case 'rtc':
+        screenView.rtc(msg);
         break;
       case 'screenOff':
         screenView.screenOff(msg.on);

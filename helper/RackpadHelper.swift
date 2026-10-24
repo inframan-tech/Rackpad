@@ -3,7 +3,7 @@
 // Reads one JSON command per line on stdin (sent by the Node server), posts
 // the matching mouse/keyboard events, draws the cursor beacon and click
 // ripples, and reports the frontmost app on stdout as JSON lines. When the
-// phone watches the screen, JPEG frames go out on file descriptor 3.
+// phone watches the screen, H.264 frames go out on file descriptor 3.
 //
 // Build: swiftc -O -swift-version 5 -o rackpad-helper RackpadHelper.swift
 // (the Node server does this automatically on first run).
@@ -11,10 +11,11 @@
 import AppKit
 import ApplicationServices
 import Carbon
-import CoreImage
+import CoreMedia
 import IOKit.pwr_mgt
 import QuartzCore
 @preconcurrency import ScreenCaptureKit
+import VideoToolbox
 
 // MARK: - Output to Node
 
@@ -538,30 +539,120 @@ final class AppWatcher {
 
 // MARK: - Screen streaming
 
-/// Streams the main display to the phone as JPEG frames on file descriptor 3,
-/// each a 4-byte big-endian length followed by the image. ScreenCaptureKit
-/// only hands over a frame when something on screen changed, so a still
-/// screen costs nothing.
-// Its state is only touched on the main thread; frames are handled on `queue`.
+/// Hardware H.264 for WebRTC: constrained baseline (every phone decodes it),
+/// no B-frames, low-latency rate control, a keyframe at least every 2 s and
+/// whenever asked. Each access unit comes out as 4-byte-length-prefixed NAL
+/// units, with SPS and PPS in front of every keyframe.
+final class H264Encoder {
+    typealias Output = (_ au: Data, _ keyframe: Bool, _ ptsMicros: Int64) -> Void
+    private let session: VTCompressionSession
+    private let output: Output
+    private var forceKey = true
+
+    init?(width: Int, height: Int, fps: Int, bitrate: Int, output: @escaping Output) {
+        self.output = output
+        let spec = [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true] as CFDictionary
+        var s: VTCompressionSession?
+        guard VTCompressionSessionCreate(allocator: nil, width: Int32(width), height: Int32(height), codecType: kCMVideoCodecType_H264,
+                                         encoderSpecification: spec, imageBufferAttributes: nil, compressedDataAllocator: nil,
+                                         outputCallback: nil, refcon: nil, compressionSessionOut: &s) == noErr, let session = s else { return nil }
+        self.session = session
+        let props: [CFString: CFTypeRef] = [
+            kVTCompressionPropertyKey_RealTime: kCFBooleanTrue,
+            kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
+            kVTCompressionPropertyKey_AllowFrameReordering: kCFBooleanFalse,
+            kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 2 as CFNumber,
+            kVTCompressionPropertyKey_ExpectedFrameRate: fps as CFNumber,
+            kVTCompressionPropertyKey_AverageBitRate: bitrate as CFNumber,
+            kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality: kCFBooleanTrue,
+            kVTCompressionPropertyKey_ColorPrimaries: kCVImageBufferColorPrimaries_ITU_R_709_2,
+            kVTCompressionPropertyKey_TransferFunction: kCVImageBufferTransferFunction_ITU_R_709_2,
+            kVTCompressionPropertyKey_YCbCrMatrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+        ]
+        for (key, value) in props { VTSessionSetProperty(session, key: key, value: value) }
+        VTCompressionSessionPrepareToEncodeFrames(session)
+    }
+
+    deinit {
+        VTCompressionSessionInvalidate(session)
+    }
+
+    func requestKeyframe() {
+        forceKey = true
+    }
+
+    func encode(_ pixels: CVPixelBuffer, pts: CMTime) {
+        var options: CFDictionary?
+        if forceKey {
+            forceKey = false
+            options = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
+        }
+        VTCompressionSessionEncodeFrame(session, imageBuffer: pixels, presentationTimeStamp: pts, duration: .invalid,
+                                        frameProperties: options, infoFlagsOut: nil) { [weak self] status, _, sample in
+            guard status == noErr, let sample = sample else { return }
+            self?.emit(sample)
+        }
+    }
+
+    private func emit(_ sample: CMSampleBuffer) {
+        guard let block = CMSampleBufferGetDataBuffer(sample) else { return }
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]]
+        let keyframe = !(attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
+        var au = Data()
+        if keyframe, let format = CMSampleBufferGetFormatDescription(sample) {
+            // SPS and PPS, so a phone that joins (or lost the picture) can start right here.
+            var count = 0
+            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: 0, parameterSetPointerOut: nil,
+                                                               parameterSetSizeOut: nil, parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil)
+            for i in 0..<count {
+                var set: UnsafePointer<UInt8>?
+                var size = 0
+                CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: i, parameterSetPointerOut: &set,
+                                                                   parameterSetSizeOut: &size, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
+                guard let set = set else { continue }
+                var length = UInt32(size).bigEndian
+                au.append(Data(bytes: &length, count: 4))
+                au.append(set, count: size)
+            }
+        }
+        var total = 0
+        var base: UnsafeMutablePointer<CChar>?
+        guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &total, dataPointerOut: &base) == noErr,
+              let base = base else { return }
+        au.append(Data(bytes: base, count: total)) // already length-prefixed NAL units
+        let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+        output(au, keyframe, Int64(CMTimeGetSeconds(pts) * 1_000_000))
+    }
+}
+
+/// Streams the main display to the phone as H.264 on file descriptor 3, one
+/// access unit per frame: a 4-byte big-endian length, then a flags byte
+/// (1 = keyframe), the capture time in µs (8 bytes, big-endian) and the NAL
+/// units. ScreenCaptureKit only hands over a frame when something on screen
+/// changed, so a still screen costs nothing.
+// `stream`/`starting`/`bounds` are only touched on the main thread; the
+// encoder and the last picture only on `queue`.
 final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private var stream: SCStream?
     private var starting = false
-    private var quality = 0.6
     private let queue = DispatchQueue(label: "rackpad.screen", qos: .userInteractive)
-    private let ci = CIContext(options: [.cacheIntermediates: false])
     private let out: FileHandle? = fcntl(3, F_GETFD) == -1 ? nil : FileHandle(fileDescriptor: 3, closeOnDealloc: false)
+    private var encoder: H264Encoder?
+    private var capturing: SCStream?
+    private var last: CVPixelBuffer?
+    private var lastAt: TimeInterval = 0
     /// The streamed display, in global coordinates (where taps on the picture go).
     private(set) var bounds = CGDisplayBounds(CGMainDisplayID())
 
-    func start(maxWidth: Int, fps: Int, quality: Double) {
-        self.quality = min(max(quality, 0.2), 0.95)
-        guard out != nil, stream == nil, !starting else { return }
+    func start(maxWidth: Int, fps: Int, bitrate: Int) {
+        guard let out = out, stream == nil, !starting else { return }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess() // the system's own prompt, once
             emit(["ev": "screen", "on": false, "error": "permission"])
             return
         }
         starting = true
+        let fps = min(max(fps, 1), 60)
         Task {
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -572,15 +663,34 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 let screen = NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display.displayID }
                 let pixelsWide = Double(display.width) * Double(screen?.backingScaleFactor ?? 2)
                 let width = min(Double(max(maxWidth, 320)), pixelsWide)
+                let even = { (v: Double) in Int(v / 2) * 2 } // H.264 wants even sizes
                 let config = SCStreamConfiguration()
-                config.width = Int(width)
-                config.height = Int((width * Double(display.height) / Double(display.width)).rounded())
-                config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(min(max(fps, 1), 60)))
-                config.pixelFormat = kCVPixelFormatType_32BGRA
+                config.width = even(width)
+                config.height = even(width * Double(display.height) / Double(display.width))
+                config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+                config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange // what the encoder eats, no conversion
+                config.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
+                config.colorSpaceName = CGColorSpace.sRGB
                 config.showsCursor = true
-                config.queueDepth = 3
+                config.queueDepth = 5
+                guard let encoder = H264Encoder(width: config.width, height: config.height, fps: fps, bitrate: bitrate, output: { au, key, pts in
+                    var length = UInt32(au.count + 9).bigEndian
+                    var frame = Data(bytes: &length, count: 4)
+                    frame.append(key ? 1 : 0)
+                    var time = pts.bigEndian
+                    frame.append(Data(bytes: &time, count: 8))
+                    frame.append(au)
+                    out.write(frame)
+                }) else {
+                    throw NSError(domain: "Rackpad", code: 2, userInfo: [NSLocalizedDescriptionKey: "the H.264 encoder didn't start"])
+                }
                 let s = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: config, delegate: self)
                 try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+                queue.sync {
+                    self.encoder = encoder
+                    self.capturing = s
+                    self.last = nil
+                }
                 try await s.startCapture()
                 let displayID = display.displayID
                 DispatchQueue.main.async {
@@ -591,6 +701,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 emit(["ev": "screen", "on": true, "width": config.width, "height": config.height])
             } catch {
                 DispatchQueue.main.async { self.starting = false }
+                self.queue.async { self.release() }
                 let declined = (error as NSError).code == -3801 // SCStreamError.userDeclined
                 emit(["ev": "screen", "on": false, "error": declined ? "permission" : error.localizedDescription])
             }
@@ -601,26 +712,43 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         guard let s = stream else { return }
         stream = nil
         s.stopCapture { _ in }
+        queue.async { self.release() }
         emit(["ev": "screen", "on": false])
+    }
+
+    /// A phone joined or lost the picture. On a still screen there's no new
+    /// frame coming, so the last one goes out again as the keyframe.
+    func keyframe() {
+        queue.async {
+            guard let encoder = self.encoder else { return }
+            encoder.requestKeyframe()
+            if let last = self.last, now() - self.lastAt > 0.1 {
+                self.lastAt = now()
+                encoder.encode(last, pts: CMClockGetTime(CMClockGetHostTimeClock()))
+            }
+        }
+    }
+
+    private func release() {
+        encoder = nil
+        capturing = nil
+        last = nil
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         DispatchQueue.main.async { if self.stream === stream { self.stream = nil } }
+        queue.async { if self.capturing === stream { self.release() } }
         emit(["ev": "screen", "on": false, "error": error.localizedDescription])
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, sample.isValid, let out = out,
+        guard type == .screen, sample.isValid, stream === capturing, let encoder = encoder,
               let info = (CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])?.first,
               let raw = info[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
-              let pixels = sample.imageBuffer,
-              let srgb = CGColorSpace(name: CGColorSpace.sRGB) else { return }
-        let options = [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): quality]
-        guard let jpeg = ci.jpegRepresentation(of: CIImage(cvPixelBuffer: pixels), colorSpace: srgb, options: options) else { return }
-        var length = UInt32(jpeg.count).bigEndian
-        var frame = Data(bytes: &length, count: 4)
-        frame.append(jpeg)
-        out.write(frame)
+              let pixels = sample.imageBuffer else { return }
+        last = pixels
+        lastAt = now()
+        encoder.encode(pixels, pts: sample.presentationTimeStamp)
     }
 }
 
@@ -729,8 +857,10 @@ func handle(_ cmd: [String: Any]) {
         DispatchQueue.main.async { beacon.poke() }
     case "screen":
         let on = (cmd["on"] as? Bool) ?? false
-        let width = Int(num(cmd["maxWidth"])), fps = Int(num(cmd["fps"])), quality = num(cmd["quality"])
-        DispatchQueue.main.async { on ? streamer.start(maxWidth: width, fps: fps, quality: quality) : streamer.stop() }
+        let width = Int(num(cmd["maxWidth"])), fps = Int(num(cmd["fps"])), bitrate = Int(num(cmd["bitrate"]))
+        DispatchQueue.main.async { on ? streamer.start(maxWidth: width, fps: fps, bitrate: max(bitrate, 500_000)) : streamer.stop() }
+    case "keyframe":
+        streamer.keyframe()
     case "screenOff":
         let on = (cmd["on"] as? Bool) ?? false
         DispatchQueue.main.async { on ? screenOff.on() : screenOff.off() }

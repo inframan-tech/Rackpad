@@ -15,10 +15,12 @@ export const HELPER_SOURCE = path.join(HERE, '..', 'helper', 'RackpadHelper.swif
 const HELPER_BIN = path.join(CONFIG_DIR, 'bin', 'rackpad-helper');
 
 const DEFAULT_APP = { bundleId: 'com.apple.finder', name: 'Finder' };
-const DRY_RUN_SCREEN = path.join(HERE, 'dry-run-screen.jpg');
+// Three seconds of a stand-in screen, encoded by the helper's H.264 encoder.
+const DRY_RUN_SCREEN = path.join(HERE, 'dry-run-screen.h264');
+const DRY_RUN_FPS = 30;
 
 // Screen frames from the helper (file descriptor 3): a 4-byte big-endian
-// length, then a JPEG. Chunks from the pipe arrive split anywhere.
+// length, then the frame. Chunks from the pipe arrive split anywhere.
 export class FrameReader {
   constructor(onFrame, { maxFrame = 16 * 1024 * 1024 } = {}) {
     this.onFrame = onFrame;
@@ -39,6 +41,19 @@ export class FrameReader {
       this.buf = this.buf.subarray(4 + len);
     }
   }
+}
+
+// One frame: a flags byte (1 = keyframe), the capture time in µs (8 bytes,
+// big-endian), then the H.264 access unit as length-prefixed NAL units.
+export function parseFrame(buf) {
+  if (buf.length < 9) return null;
+  return { key: (buf[0] & 1) === 1, pts: Number(buf.readBigInt64BE(1)), au: buf.subarray(9) };
+}
+
+export function readFrames(buf) {
+  const frames = [];
+  new FrameReader((f) => frames.push(parseFrame(f))).push(buf);
+  return frames.filter(Boolean);
 }
 
 // For --verbose logs: every command, but never what was typed.
@@ -87,19 +102,27 @@ export class DryRunBackend extends Backend {
       if (op.k === 'mute') this.muted = !this.muted;
     }
     if (op.op === 'screen') this.fakeScreen(!!op.on);
+    if (op.op === 'keyframe') this.screenAt = this.screenFrames?.findIndex((f, i) => f.key && i >= this.screenAt) ?? 0;
     if (op.op === 'screenOff') this.emit('screenOff', !!op.on);
     if (this.verbose) this.log(`→ ${describeOp(op)}`);
   }
 
-  // A stand-in picture a few times a second, so the screen view can be tried anywhere.
+  // A stand-in screen on a loop, so the screen view can be tried anywhere.
   fakeScreen(on) {
     clearInterval(this.screenTimer);
     this.screenTimer = null;
     this.emit('screen', { on, error: null, width: 640, height: 400 });
     if (!on) return;
-    this.screenFrame ??= fs.readFileSync(DRY_RUN_SCREEN);
-    this.emit('frame', this.screenFrame);
-    this.screenTimer = setInterval(() => this.emit('frame', this.screenFrame), 250);
+    this.screenFrames ??= readFrames(fs.readFileSync(DRY_RUN_SCREEN));
+    this.screenAt = 0;
+    let pts = 0;
+    this.screenTimer = setInterval(() => {
+      if (this.screenAt < 0) this.screenAt = 0; // asked for a keyframe past the last one: the loop starts with one
+      const frame = this.screenFrames[this.screenAt];
+      this.screenAt = (this.screenAt + 1) % this.screenFrames.length;
+      this.emit('frame', { ...frame, pts });
+      pts += 1e6 / DRY_RUN_FPS;
+    }, 1000 / DRY_RUN_FPS);
     this.screenTimer.unref();
   }
 
@@ -138,7 +161,10 @@ export class NativeBackend extends Backend {
     this.proc = proc;
     proc.stdin.on('error', () => {});
     createInterface({ input: proc.stdout }).on('line', (line) => this.onLine(line));
-    const frames = new FrameReader((jpeg) => this.emit('frame', jpeg));
+    const frames = new FrameReader((buf) => {
+      const frame = parseFrame(buf);
+      if (frame) this.emit('frame', frame);
+    });
     proc.stdio[3].on('data', (chunk) => frames.push(chunk));
     proc.stdio[3].on('error', () => {});
     proc.on('error', (err) => this.setStatus({ ready: false, error: err.message }));

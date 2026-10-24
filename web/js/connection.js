@@ -51,7 +51,6 @@ export class Connection extends EventTarget {
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
     this.setState('connecting');
     const ws = new WebSocket(this.url);
-    ws.binaryType = 'arraybuffer'; // screen frames
     this.ws = ws;
     ws.onopen = () => {
       this.retry = 0;
@@ -59,10 +58,6 @@ export class Connection extends EventTarget {
       this.ping();
     };
     ws.onmessage = (e) => {
-      if (typeof e.data !== 'string') {
-        this.dispatchEvent(new CustomEvent('frame', { detail: e.data }));
-        return;
-      }
       let msg;
       try {
         msg = JSON.parse(e.data);

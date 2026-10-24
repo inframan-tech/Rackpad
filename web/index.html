@@ -78,8 +78,13 @@
 
     <section class="view" data-view="screen">
       <div class="screen" id="screen" aria-label="Your Mac's screen">
-        <img id="screen-img" alt="">
+        <video id="screen-video" playsinline muted autoplay disablepictureinpicture></video>
         <p class="screen-msg" id="screen-msg" hidden></p>
+        <div class="screen-fail" id="screen-fail" hidden>
+          <b>I'm not going to stream over JPEG — get the hell out.</b>
+          <small id="screen-fail-why"></small>
+          <button class="pill" id="screen-retry">Try again</button>
+        </div>
       </div>
       <button class="screen-off" id="screen-off" aria-pressed="false" aria-label="Turn the Mac's screen off while you watch"><i data-icon="moon"></i></button>
     </section>

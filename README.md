@@ -32,6 +32,12 @@ your Wi-Fi: no cloud, no account.
   A soft light follows your finger, each click leaves a ring on the phone and
   a ripple on the Mac, and the Mac's cursor glows while the phone drives it,
   so you can find it from the couch.
+- **Your Mac's screen on the phone.** The Screen tab shows the Mac live, and
+  a tap lands right where you touch the picture: tap to click, hold to
+  right-click, drag, scroll with two fingers. It's WebRTC video from the
+  Mac's hardware H.264 encoder at up to 60 fps, shown the moment each frame
+  arrives. The moon button darkens the Mac's own screen while you watch.
+  Needs Screen Recording permission for the app Rackpad runs in.
 - **Smooth on real Wi-Fi.** Every touch carries the moment your finger made
   it, and the Mac plays movement back at that pace instead of in the clumps
   Wi-Fi delivers it in (see [How it works](#how-it-works)).
@@ -163,7 +169,10 @@ npx rackpad build-helper    recompile the native helper
 │ live typing diff │  or HTTP     │ finger's pace,    │  scroll/key/ │ input, cursor glow  │
 │ click wheel      │ ◀─────────── │ acceleration,     │  text/media  │ and click ripples,  │
 │ keeps link warm  │  front app,  │ momentum, layouts │ ◀─────────── │ front-app watcher   │
-└──────────────────┘  volume      └───────────────────┘  front app   └─────────────────────┘
+│                  │  volume      │                   │  front app   │                     │
+│ <video> of the   │  WebRTC      │ one WebRTC link   │  H.264 on    │ ScreenCaptureKit →  │
+│ Mac's screen     │ ◀─────────── │ per phone         │ ◀─────────── │ VideoToolbox H.264  │
+└──────────────────┘  (RTP/UDP)   └───────────────────┘  fd 3        └─────────────────────┘
 ```
 
 - `web/` is the phone app: plain ES modules, no build step. Gesture
@@ -174,12 +183,21 @@ npx rackpad build-helper    recompile the native helper
   `Playout` learns the network's quickest trip and how much later most
   messages arrive, and plays every movement that far behind your finger,
   spread evenly across the time it took. On calm Wi-Fi that's a few ms.
+- `server/rtc.js` sends the screen over WebRTC with
+  [libdatachannel](https://github.com/paullouisageneau/libdatachannel): a
+  send-only H.264 track per phone, lost packets resent, a fresh keyframe when
+  a phone joins or loses the picture, and a request for zero playout delay so
+  nothing buffers between the Mac and your finger. The phone's offer and
+  answer ride the WebSocket. There is no fallback: if WebRTC can't connect,
+  the phone says so rather than streaming JPEGs.
 - `server/tls.js` runs the local certificate authority and renews the Mac's
   certificate when it joins a new network.
 - `helper/RackpadHelper.swift` posts real mouse, scroll, keyboard and
   media-key events, maps shortcuts to your keyboard layout (⌘Z is ⌘Z on
   AZERTY too), draws the cursor glow and ripples as click-through overlays,
-  and reports the app in front.
+  and reports the app in front. While a phone watches, it captures the screen
+  only when something changes and encodes it in hardware (constrained
+  baseline, no B-frames, low-latency rate control) in about 5 ms.
 
 ## Development
 
@@ -214,7 +232,8 @@ them: `npm i -D playwright && npx playwright install chromium`.
 - Hold-to-talk dictation: hold the mic, speak, let go (needs the secure
   connection).
 - A live camera scanner for pairing.
-- Command palette for any app's menus, an air mouse and laser pointer, a live
-  mini screen to tap on, and a phone dock of your open apps.
+- Command palette for any app's menus, an air mouse and laser pointer, and a
+  phone dock of your open apps.
+- Streaming an external display, not just the built-in one.
 - Later, a native iPhone app for real haptics, Apple Watch control and
   lock-screen widgets.
